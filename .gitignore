@@ -5,6 +5,8 @@ __pycache__/
 
 # Environments
 .env
+.env.*
+!.env.example
 .venv
 env/
 venv/
@@ -26,3 +28,36 @@ venv.bak/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Runtime output
+*.log
+*.pid
+*.tmp
+*.temp
+logs/
+tmp/
+uploads/
+reports/
+scratch/
+
+# Packet captures and local databases
+*.pcap
+*.pcapng
+*.db
+*.sqlite
+*.sqlite3
+
+# Credentials, certificates, and local signing material
+*.pem
+*.key
+*.p12
+*.pfx
+*.cer
+*.crt
+
+# Local caches and editor backups
+.cache/
+.mypy_cache/
+.ruff_cache/
+model_cache/
+*.backup

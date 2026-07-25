@@ -21,3 +21,7 @@ from app.schemas.decision import (
     AnalyzeRequest, DecisionResponse,
     Model1Input, Model2Input, Model3Input,
 )
+from app.schemas.threat_alert import (
+    ThreatAlertResponse, ThreatAlertListResponse,
+    ThreatAlertStatsResponse, ThreatAlertStatusUpdate,
+)

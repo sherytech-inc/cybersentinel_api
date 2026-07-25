@@ -12,6 +12,9 @@ from app.repositories.repositories import (
     ResponseActionRepository,
     ReportRepository,
     CopilotConversationRepository,
+    FirewallActionRepository,
+    ThreatAlertRepository,
+    AnalystNoteRepository,
 )
 
 
@@ -39,13 +42,24 @@ def get_report_repo(db: AsyncClient = Depends(get_db_client)) -> ReportRepositor
 def get_copilot_repo(db: AsyncClient = Depends(get_db_client)) -> CopilotConversationRepository:
     return CopilotConversationRepository(db)
 
+def get_firewall_action_repo(db: AsyncClient = Depends(get_db_client)) -> FirewallActionRepository:
+    return FirewallActionRepository(db)
+
+def get_threat_alert_repo(db: AsyncClient = Depends(get_db_client)) -> ThreatAlertRepository:
+    return ThreatAlertRepository(db)
+
+def get_analyst_note_repo(db: AsyncClient = Depends(get_db_client)) -> AnalystNoteRepository:
+    return AnalystNoteRepository(db)
+
 
 __all__ = [
     "PacketRepository", "FirewallLogRepository", "VirusScanRepository",
     "IPIntelligenceRepository", "ThreatScoreRepository",
     "ResponseActionRepository", "ReportRepository",
-    "CopilotConversationRepository",
+    "CopilotConversationRepository", "FirewallActionRepository",
+    "ThreatAlertRepository", "AnalystNoteRepository",
     "get_packet_repo", "get_firewall_repo", "get_virus_repo",
     "get_ip_intel_repo", "get_threat_score_repo", "get_response_repo",
-    "get_report_repo", "get_copilot_repo",
+    "get_report_repo", "get_copilot_repo", "get_firewall_action_repo",
+    "get_threat_alert_repo", "get_analyst_note_repo",
 ]

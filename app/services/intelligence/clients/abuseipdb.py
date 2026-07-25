@@ -5,8 +5,14 @@ Queries /check endpoint. Weight in scoring: 40%.
 import logging
 from typing import Optional
 from app.core.config import get_settings
-from app.schemas.intelligence import AbuseIPDBResult
+from app.schemas.intelligence import AbuseIpDbIntelResult, IntelProviderStatus
 from app.services.intelligence.clients.base import BaseHTTPClient
+from app.services.intelligence.exceptions import (
+    ProviderError,
+    ProviderNotFoundError,
+    ProviderQuotaExceededError,
+    ProviderUnavailableError,
+)
 
 logger = logging.getLogger(__name__)
 _s = get_settings()
@@ -18,28 +24,44 @@ class AbuseIPDBClient(BaseHTTPClient):
     def __init__(self):
         super().__init__()
         self._default_headers = {
-            "Key": _s.ABUSEIPDB_API_KEY,
             "Accept": "application/json",
+            "Key": _s.ABUSEIPDB_API_KEY or "",
         }
 
-    async def check_ip(self, ip: str) -> Optional[AbuseIPDBResult]:
-        raw = await self._get(
-            path="/check",
-            params={"ipAddress": ip,
-                    "maxAgeInDays": _s.ABUSEIPDB_MAX_AGE_DAYS,
-                    "verbose": ""},
-            provider_name="AbuseIPDB",
-        )
-        if raw is None: return None
-        try:
-            d = raw.get("data", {})
-            return AbuseIPDBResult(
-                abuse_confidence_score=d.get("abuseConfidenceScore", 0),
-                total_reports=d.get("totalReports", 0),
-                num_distinct_users=d.get("numDistinctUsers", 0),
-                is_whitelisted=bool(d.get("isWhitelisted", False)),
-                is_tor=bool(d.get("isTor", False)),
+    async def check_ip(self, ip: str) -> AbuseIpDbIntelResult:
+        if not _s.ABUSEIPDB_API_KEY:
+            return AbuseIpDbIntelResult(
+                status=IntelProviderStatus.not_configured,
+                message="AbuseIPDB integration is not configured.",
             )
-        except Exception as e:
-            logger.exception("AbuseIPDB parse error for %s: %s", ip, e)
-            return None
+        try:
+            raw = await self._get(
+                "/check",
+                params={"ipAddress": ip, "maxAgeInDays": _s.ABUSEIPDB_MAX_AGE_DAYS},
+                provider_name="AbuseIPDB",
+            )
+            data = raw.get("data") or {}
+            return AbuseIpDbIntelResult(
+                status=IntelProviderStatus.completed,
+                abuse_confidence_score=int(data.get("abuseConfidenceScore") or 0),
+                total_reports=int(data.get("totalReports") or 0),
+                num_distinct_users=int(data.get("numDistinctUsers") or 0),
+                is_whitelisted=data.get("isWhitelisted"),
+                is_tor=data.get("isTor"),
+            )
+        except ProviderNotFoundError:
+            return AbuseIpDbIntelResult(
+                status=IntelProviderStatus.not_found,
+                message="No AbuseIPDB report was found for this IP.",
+            )
+        except ProviderQuotaExceededError:
+            return AbuseIpDbIntelResult(
+                status=IntelProviderStatus.quota_exceeded,
+                message="AbuseIPDB is rate limited.",
+            )
+        except (ProviderError, ProviderUnavailableError) as exc:
+            logger.warning("AbuseIPDB lookup unavailable | type=%s", type(exc).__name__)
+            return AbuseIpDbIntelResult(
+                status=IntelProviderStatus.unavailable,
+                message="AbuseIPDB is temporarily unavailable.",
+            )

@@ -26,6 +26,8 @@ class FirewallLogIngestRequest(BaseModel):
     interface: Optional[str] = None
     direction: Optional[str] = None               # inbound | outbound
     logged_at: Optional[datetime] = None
+    import_id: Optional[UUID] = None
+    source_line_number: Optional[int] = None
 
 
 class FirewallLogBulkRequest(BaseModel):

@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
+from enum import Enum
 from pydantic import BaseModel, Field
 
 
@@ -15,27 +16,45 @@ from pydantic import BaseModel, Field
 # Virus Scanner
 # ─────────────────────────────────────────────────────────────────────────────
 
+class ScanStatus(str, Enum):
+    completed = "completed"
+    pending = "pending"
+    not_found = "not_found"
+    not_configured = "not_configured"
+    quota_exceeded = "quota_exceeded"
+    unavailable = "unavailable"
+    invalid_target = "invalid_target"
+    failed = "failed"
+    file_too_large = "file_too_large"
+
+
 class VirusScanRequest(BaseModel):
     scan_target: str = Field(..., description="File hash (SHA-256), URL, or IP address.")
-    scan_type: str = Field(..., examples=["file", "url", "ip"])
-    file_name: Optional[str] = None
-    file_hash_sha256: Optional[str] = None
-    file_size_bytes: Optional[int] = None
+    scan_type: str = Field(..., examples=["hash", "url", "ip"])
+
+
+class URLScanRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=4096)
+
+
+class HashScanRequest(BaseModel):
+    hash: str = Field(min_length=1, max_length=64)
 
 
 class VirusScanResponse(BaseModel):
-    id: UUID
-    scan_target: str
+    scan_id: Optional[UUID] = None
+    target: str
     scan_type: str
-    file_name: Optional[str] = None
-    vt_malicious: int
-    vt_suspicious: int
-    vt_harmless: int
-    vt_total_engines: int
-    vt_permalink: Optional[str] = None
-    threat_level: Optional[str] = None
-    threat_score: Optional[float] = None
-    status: str
+    status: ScanStatus
+    verdict: str = "unknown"
+    provider: str = "VIRUSTOTAL"
+    provider_contacted: bool = False
+    malicious: int = 0
+    suspicious: int = 0
+    harmless: int = 0
+    undetected: int = 0
+    analysis_id: Optional[str] = None
+    message: Optional[str] = None
     scanned_at: Optional[datetime] = None
 
 
