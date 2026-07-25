@@ -24,15 +24,15 @@ PROTOCOL_CATEGORIES = ["TCP", "UDP", "ICMP", "OTHER"]
 
 FEATURE_COLUMNS = [
     "flow_duration",
-    "total_fwd_packets",
-    "total_backward_packets",
-    "flow_bytes_per_second",
-    "flow_packets_per_second",
-    "packet_length_mean",
-    "packet_length_std",
-    "flow_iat_mean",
-    "flow_iat_std",
-    "destination_port",
+    "src_pkts",
+    "dst_pkts",
+    "src_bytes",
+    "dst_bytes",
+    "pkt_len_mean",
+    "pkt_len_std",
+    "iat_mean",
+    "iat_std",
+    "src_port",
     "protocol"
 ]
 # ==========================================

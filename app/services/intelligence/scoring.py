@@ -7,7 +7,13 @@ Uses M4_SAFE_MAX / M4_LOW_MAX / M4_HIGH_MAX thresholds from config (single sourc
 import logging
 from typing import Optional
 from app.core.config import get_settings
-from app.schemas.intelligence import AbuseIPDBResult, GeoIPResult, IntelSeverity, VirusTotalResult
+from app.schemas.intelligence import (
+    AbuseIpDbIntelResult,
+    GeoIpIntelResult,
+    IntelProviderStatus,
+    IntelSeverity,
+    VirusTotalIntelResult,
+)
 
 logger = logging.getLogger(__name__)
 _s = get_settings()
@@ -35,9 +41,9 @@ class ThreatScoringEngine:
 
     def compute(
         self,
-        abuse: Optional[AbuseIPDBResult],
-        vt: Optional[VirusTotalResult],
-        geo: Optional[GeoIPResult],
+        abuse: AbuseIpDbIntelResult,
+        vt: VirusTotalIntelResult,
+        geo: GeoIpIntelResult,
     ) -> tuple[int, IntelSeverity]:
         abuse_n = self._score_abuse(abuse)
         vt_n    = self._score_virustotal(vt)
@@ -45,40 +51,40 @@ class ThreatScoringEngine:
 
         raw = self._w_abuse * abuse_n + self._w_vt * vt_n + self._w_geo * geo_n
 
-        if abuse and abuse.is_tor:
+        if abuse.status == IntelProviderStatus.completed and abuse.is_tor:
             raw = max(raw, 0.75)
-        if abuse and abuse.is_whitelisted:
+        if abuse.status == IntelProviderStatus.completed and abuse.is_whitelisted:
             raw = min(raw, 0.15)
 
         intel_score = min(100, max(0, round(raw * 100)))
         return intel_score, self._severity(intel_score)
 
     @staticmethod
-    def _score_abuse(abuse: Optional[AbuseIPDBResult]) -> float:
-        if abuse is None:
-            return 0.30
-        base = abuse.abuse_confidence_score / 100.0
-        if abuse.num_distinct_users > 50:
+    def _score_abuse(abuse: AbuseIpDbIntelResult) -> float:
+        if abuse.status != IntelProviderStatus.completed:
+            return 0.0
+        base = (abuse.abuse_confidence_score or 0) / 100.0
+        if (abuse.num_distinct_users or 0) > 50:
             base = min(1.0, base + 0.05)
-        if abuse.total_reports > 500:
+        if (abuse.total_reports or 0) > 500:
             base = min(1.0, base + 0.03)
         return base
 
     @staticmethod
-    def _score_virustotal(vt: Optional[VirusTotalResult]) -> float:
-        if vt is None:
-            return 0.30
-        if vt.vt_total_engines == 0:
+    def _score_virustotal(vt: VirusTotalIntelResult) -> float:
+        if vt.status != IntelProviderStatus.completed:
+            return 0.0
+        if not vt.total_engines or vt.total_engines == 0:
             return 0.10
-        weighted = vt.vt_malicious + 0.5 * vt.vt_suspicious
-        return min(1.0, weighted / vt.vt_total_engines)
+        weighted = (vt.malicious or 0) + 0.5 * (vt.suspicious or 0)
+        return min(1.0, weighted / vt.total_engines)
 
     @staticmethod
-    def _score_geo(geo: Optional[GeoIPResult]) -> float:
-        if geo is None:
-            return 0.20
+    def _score_geo(geo: GeoIpIntelResult) -> float:
+        if geo.status != IntelProviderStatus.completed:
+            return 0.0
         score = 0.0
-        if geo.country_code.upper() in _HIGH_RISK_COUNTRIES:
+        if (geo.country_code or "XX").upper() in _HIGH_RISK_COUNTRIES:
             score += 0.40
         if geo.is_proxy:
             score += 0.30

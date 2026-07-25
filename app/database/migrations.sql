@@ -7,7 +7,7 @@
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- =============================================================================
--- USERS
+-- USERS (Legacy Application Table - to be deprecated by auth.users)
 -- =============================================================================
 CREATE TABLE IF NOT EXISTS users (
     id            UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -18,6 +18,47 @@ CREATE TABLE IF NOT EXISTS users (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- =============================================================================
+-- AUTHORIZED USERS & PROFILES (Supabase Auth Integration)
+-- =============================================================================
+CREATE EXTENSION IF NOT EXISTS citext;
+
+CREATE TABLE IF NOT EXISTS public.authorized_users (
+    email citext PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('analyst', 'admin')),
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS public.profiles (
+    user_id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+    email citext NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('analyst', 'admin')),
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS profiles_role_idx ON public.profiles(role);
+
+ALTER TABLE public.authorized_users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+
+-- RLS Policies
+-- authorized_users: No direct anon or authenticated-user policy. Backend service-role access only.
+
+-- profiles: Authenticated users may SELECT their own row.
+CREATE POLICY "Users can view their own profile"
+    ON public.profiles FOR SELECT
+    TO authenticated
+    USING (auth.uid() = user_id);
+
+-- Admins manage profiles via backend service role (bypassing RLS).
+-- No INSERT/UPDATE/DELETE policies are exposed to clients.
 
 -- =============================================================================
 -- PACKETS
@@ -260,3 +301,75 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_logs(user_id);
 CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action);
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at DESC);
+
+-- =============================================================================
+-- FIREWALL ACTIONS  (User / Chatbot / Auto-triggered IP actions)
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS firewall_actions (
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    ip          TEXT NOT NULL,
+    action      TEXT NOT NULL CHECK (action IN ('BLOCK', 'UNBLOCK', 'WHITELIST')),
+    reason      TEXT,
+    source      TEXT NOT NULL DEFAULT 'USER' CHECK (source IN ('USER', 'CHATBOT', 'AUTO')),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_firewall_actions_ip ON firewall_actions(ip);
+CREATE INDEX IF NOT EXISTS idx_firewall_actions_action ON firewall_actions(action);
+CREATE INDEX IF NOT EXISTS idx_firewall_actions_created ON firewall_actions(created_at DESC);
+
+
+-- =============================================================================
+-- THREAT ALERTS (Phase 7)
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS threat_alerts (
+    alert_id                UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    source_ip               TEXT NOT NULL,
+    severity                TEXT NOT NULL CHECK (severity IN ('HIGH', 'CRITICAL')),
+    action                  TEXT NOT NULL,
+    status                  TEXT NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'INVESTIGATING', 'RESOLVED', 'FALSE_POSITIVE')),
+    threat_score            FLOAT NOT NULL,
+    summary                 TEXT NOT NULL,
+    explanation             JSONB NOT NULL,
+    trace_id                UUID,
+    
+    -- Model scores
+    model1_score            FLOAT,
+    model2_score            FLOAT,
+    model3_score            FLOAT,
+    
+    -- Model details
+    model1_classification   TEXT,
+    model2_severity         TEXT,
+    model3_severity         TEXT,
+    
+    -- Duplication mitigation
+    occurrence_count        INTEGER NOT NULL DEFAULT 1,
+    
+    -- Future chatbot & timeline
+    timeline                JSONB DEFAULT '[]'::jsonb,
+    context_ready           BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_threat_alerts_ip ON threat_alerts(source_ip);
+CREATE INDEX IF NOT EXISTS idx_threat_alerts_status ON threat_alerts(status);
+CREATE INDEX IF NOT EXISTS idx_threat_alerts_severity ON threat_alerts(severity);
+CREATE INDEX IF NOT EXISTS idx_threat_alerts_created_at ON threat_alerts(created_at DESC);
+
+-- =============================================================================
+-- REPORT SNAPSHOTS (Phase 9)
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS report_snapshots (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    generated_at TIMESTAMPTZ NOT NULL,
+    time_range VARCHAR(20),
+    total_threats INTEGER,
+    critical_threats INTEGER,
+    blocked_ips INTEGER,
+    report_json JSONB,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_report_snapshots_generated_at ON report_snapshots(generated_at DESC);

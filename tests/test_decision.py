@@ -285,7 +285,7 @@ class TestArchitectureSpecCases:
         )
 
     def test_case3_known_bad_ip(self, engine):
-        """RF=Normal, IF=10, Intel=95 → Alert (intel dominates)"""
+        """RF=Normal, IF=10, Intel=95 → Critical / BLOCK (intel blacklist override)"""
         req = AnalyzeRequest(
             model1=Model1Input(prediction="Normal", confidence=0.97),
             model2=Model2Input(anomaly_score=10.0),
@@ -296,14 +296,9 @@ class TestArchitectureSpecCases:
             source_ip="185.220.101.45",
         )
         resp = engine.analyze(req)
-        # M1=0*0.5=0, M2=10*0.2=2, M3=95*0.3=28.5 → ~30.5 → Low/Monitor
-        # But this demonstrates that intel alone raises the score
-        assert resp.final_score >= 25.0
-        assert resp.recommended_action in (
-            RecommendedAction.MONITOR,
-            RecommendedAction.INVESTIGATE,
-            RecommendedAction.ALERT,
-        )
+        assert resp.final_score == 95.0
+        assert resp.recommended_action == RecommendedAction.BLOCK
+        assert resp.final_severity == ThreatSeverity.CRITICAL
 
     def test_case4_all_agree_block(self, engine):
         """RF=Malicious, IF=90, Intel=95 → Block (everything agrees)"""
@@ -469,3 +464,278 @@ class TestDecisionRoutes:
         r = client.get("/api/v1/decision/thresholds")
         assert r.status_code == 200
         assert "severity" in r.json() and "action" in r.json()
+
+
+class TestSIEMOverrides:
+    def test_scenario_a_safe_dns(self, engine):
+        req = AnalyzeRequest(
+            model1=Model1Input(prediction="Normal", confidence=0.98),
+            model2=Model2Input(anomaly_score=10.0),
+            model3=Model3Input(
+                abuse_score=0.0, vt_malicious=0, vt_total_engines=70,
+                intel_score=0.0, intel_severity="Safe",
+                country="US", is_proxy=False, blacklisted=False
+            ),
+            source_ip="8.8.8.8"
+        )
+    def test_scenario_a_safe_dns(self, engine):
+        req = AnalyzeRequest(
+            model1=Model1Input(prediction="Normal", confidence=0.98),
+            model2=Model2Input(anomaly_score=10.0),
+            model3=Model3Input(
+                abuse_score=0.0, vt_malicious=0, vt_total_engines=70,
+                intel_score=0.0, intel_severity="Safe",
+                country="US", is_proxy=False, blacklisted=False
+            ),
+            source_ip="8.8.8.8"
+        )
+        resp = engine.analyze(req)
+        assert resp.final_severity == "Safe"
+        assert resp.recommended_action == "ALLOW"
+        assert resp.final_score <= 25.0
+
+    def test_scenario_b_blacklisted_ip(self, engine):
+        req = AnalyzeRequest(
+            model1=Model1Input(prediction="Normal", confidence=0.98),
+            model2=Model2Input(anomaly_score=10.0),
+            model3=Model3Input(
+                abuse_score=0.0, vt_malicious=0, vt_total_engines=70,
+                intel_score=0.0, intel_severity="Safe",
+                country="US", is_proxy=False, blacklisted=True
+            ),
+            source_ip="1.2.3.4"
+        )
+        resp = engine.analyze(req)
+        assert resp.final_severity == "Critical"
+        assert resp.recommended_action == "BLOCK"
+        assert resp.final_score == 95.0
+        assert "IP present in threat intelligence blacklists" in " ".join(resp.explanation)
+
+    def test_scenario_c_zero_day_behavior(self, engine):
+        req = AnalyzeRequest(
+            model1=Model1Input(prediction="Normal", confidence=0.98),
+            model2=Model2Input(anomaly_score=97.0),
+            model3=Model3Input(
+                abuse_score=0.0, vt_malicious=0, vt_total_engines=70,
+                intel_score=0.0, intel_severity="Safe",
+                country="US", is_proxy=False, blacklisted=False
+            ),
+            source_ip="1.2.3.4"
+        )
+        resp = engine.analyze(req)
+        assert resp.final_severity == "Medium"
+        assert resp.recommended_action == "MONITOR"
+        assert resp.final_score == 55.0
+        assert "standalone behavioral anomaly detected" in " ".join(resp.explanation).lower()
+
+    def test_scenario_d_rf_attack_signature(self, engine):
+        req = AnalyzeRequest(
+            model1=Model1Input(prediction="Malicious", confidence=0.96),
+            model2=Model2Input(anomaly_score=10.0),
+            model3=Model3Input(
+                abuse_score=0.0, vt_malicious=0, vt_total_engines=70,
+                intel_score=0.0, intel_severity="Safe",
+                country="US", is_proxy=False, blacklisted=False
+            ),
+            source_ip="1.2.3.4"
+        )
+        resp = engine.analyze(req)
+        assert resp.final_severity == "High"
+        assert resp.recommended_action == "INVESTIGATE"
+        assert resp.final_score >= 75.0
+        assert "high-confidence attack signature detected by rf" in " ".join(resp.explanation).lower()
+
+    def test_scenario_d_rf_attack_signature_low_confidence_no_override(self, engine):
+        req = AnalyzeRequest(
+            model1=Model1Input(prediction="Malicious", confidence=0.51),
+            model2=Model2Input(anomaly_score=10.0),
+            model3=Model3Input(
+                abuse_score=0.0, vt_malicious=0, vt_total_engines=70,
+                intel_score=0.0, intel_severity="Safe",
+                country="US", is_proxy=False, blacklisted=False
+            ),
+            source_ip="1.2.3.4"
+        )
+        resp = engine.analyze(req)
+        # Should not trigger the override (so no BLOCK/INVESTIGATE override, just base math)
+        # base math: M1_raw = 100 * 0.51 = 51.
+        # final = (51 * 0.40) + (10 * 0.30) + (0 * 0.30) = 20.4 + 3.0 = 23.4.
+        # 23.4 maps to Safe / ALLOW
+        assert resp.final_score == 23.4
+        assert resp.final_severity == "Safe"
+        assert resp.recommended_action == "ALLOW"
+
+    def test_scenario_e_private_ip_rule_0_cap(self, engine):
+        # A private IP address triggering a high confidence RF attack signature
+        # Should be capped at Medium / MONITOR because there is no reputation intelligence
+        req = AnalyzeRequest(
+            model1=Model1Input(prediction="Malicious", confidence=0.98),
+            model2=Model2Input(anomaly_score=10.0),
+            model3=Model3Input(
+                abuse_score=0.0, vt_malicious=0, vt_total_engines=70,
+                intel_score=0.0, intel_severity="Safe",
+                country="US", is_proxy=False, blacklisted=False
+            ),
+            source_ip="192.168.1.50"
+        )
+        resp = engine.analyze(req)
+        assert resp.final_severity == "Medium"
+        assert resp.recommended_action == "MONITOR"
+        assert resp.final_score == 55.0
+        assert "capped at medium/monitor for private internal ip" in " ".join(resp.explanation).lower()
+
+    def test_scenario_f_standalone_reputation(self, engine):
+        req = AnalyzeRequest(
+            model1=Model1Input(prediction="Normal", confidence=0.98),
+            model2=Model2Input(anomaly_score=10.0),
+            model3=Model3Input(
+                abuse_score=0.0, vt_malicious=0, vt_total_engines=70,
+                intel_score=92.0, intel_severity="Malicious",
+                country="US", is_proxy=False, blacklisted=False
+            ),
+            source_ip="1.2.3.4"
+        )
+        resp = engine.analyze(req)
+        assert resp.final_severity == "Medium"
+        assert resp.recommended_action == "MONITOR"
+        assert resp.final_score == 65.0
+        assert "standalone severe reputation risk detected" in " ".join(resp.explanation).lower()
+
+    def test_scenario_blacklist_low_signal_no_override(self, engine):
+        # 1/91 VT malicious is below the threshold of 5, should NOT trigger override
+        req = AnalyzeRequest(
+            model1=Model1Input(prediction="Normal", confidence=0.98),
+            model2=Model2Input(anomaly_score=10.0),
+            model3=Model3Input(
+                abuse_score=10.0, vt_malicious=1, vt_total_engines=91,
+                intel_score=5.0, intel_severity="Safe",
+                country="US", is_proxy=False, blacklisted=False
+            ),
+            source_ip="1.2.3.4"
+        )
+        resp = engine.analyze(req)
+        assert resp.final_severity != "Critical"
+        assert resp.recommended_action != "BLOCK"
+
+    def test_scenario_blacklist_high_signal_override(self, engine):
+        # 6/91 VT malicious is at/above the threshold of 5, should trigger override
+        req = AnalyzeRequest(
+            model1=Model1Input(prediction="Normal", confidence=0.98),
+            model2=Model2Input(anomaly_score=10.0),
+            model3=Model3Input(
+                abuse_score=10.0, vt_malicious=6, vt_total_engines=91,
+                intel_score=30.0, intel_severity="Suspicious",
+                country="US", is_proxy=False, blacklisted=False
+            ),
+            source_ip="1.2.3.4"
+        )
+        resp = engine.analyze(req)
+        assert resp.final_severity == "Critical"
+        assert resp.recommended_action == "BLOCK"
+        assert resp.final_score == 95.0
+        assert "IP present in threat intelligence blacklists" in " ".join(resp.explanation)
+
+
+class TestUnifiedAnalyzeIntegration:
+    def test_unified_analyze_success(self, client):
+        from unittest.mock import patch
+        from datetime import datetime, timezone
+        from app.schemas.intelligence import (
+            IntelligenceResponse, VirusTotalIntelResult, AbuseIpDbIntelResult, GeoIpIntelResult
+        )
+        
+        mock_intel = IntelligenceResponse(
+            ip="8.8.8.8",
+            status="completed",
+            intel_score=0,
+            severity="Safe",
+            virustotal=VirusTotalIntelResult(status="completed", malicious=0, suspicious=0, harmless=70, undetected=0, total_engines=70),
+            abuseipdb=AbuseIpDbIntelResult(status="completed", abuse_confidence_score=0, total_reports=0, is_whitelisted=False, is_tor=False),
+            geoip=GeoIpIntelResult(status="completed", country="US", is_proxy=False, is_hosting=False),
+            message="Clean IP",
+            looked_up_at=datetime.now(timezone.utc)
+        )
+        
+        with patch("app.api.analyze_routes._model_rf.predict") as mock_rf, \
+             patch("app.api.analyze_routes._model_if.predict_raw") as mock_if, \
+             patch("app.services.intelligence.enrichment.IntelligenceEnrichmentService.enrich") as mock_enrich:
+             
+            mock_rf.return_value = {"prediction_code": 0, "classification": "Normal", "confidence_scores": {"Normal": 0.98, "Suspicious": 0.01, "Malicious": 0.01}}
+            mock_if.return_value = {"anomaly_score": 0.45, "is_anomaly": False, "normalized_score": 10.0}
+            mock_enrich.return_value = mock_intel
+            
+            body = {
+                "ip": "8.8.8.8",
+                "flow_features": {
+                    "flow_duration": 0.1,
+                    "src_pkts": 2,
+                    "dst_pkts": 2,
+                    "src_bytes": 128,
+                    "dst_bytes": 128,
+                    "pkt_len_mean": 64.0,
+                    "pkt_len_std": 0.0,
+                    "iat_mean": 0.05,
+                    "iat_std": 0.0,
+                    "src_port": 53,
+                    "protocol": "UDP"
+                }
+            }
+            
+            r = client.post("/api/v1/analyze", json=body)
+            assert r.status_code == 200
+            data = r.json()
+            assert data["ip"] == "8.8.8.8"
+            assert data["final_score"] <= 25.0
+            assert data["severity"] in ("SAFE", "NORMAL", "LOW")
+            assert data["action"] == "ALLOW"
+            assert data["degraded_mode"] is False
+            assert "trace_id" in data
+            assert "latency_ms" in data
+
+    def test_unified_analyze_degraded_mode(self, client):
+        from unittest.mock import patch
+        
+        with patch("app.api.analyze_routes._model_rf.predict") as mock_rf, \
+             patch("app.api.analyze_routes._model_if.predict_raw") as mock_if, \
+             patch("app.services.intelligence.enrichment.IntelligenceEnrichmentService.enrich") as mock_enrich:
+             
+            mock_rf.return_value = {"prediction_code": 0, "classification": "Normal", "confidence_scores": {"Normal": 0.98, "Suspicious": 0.01, "Malicious": 0.01}}
+            mock_if.return_value = {"anomaly_score": 0.45, "is_anomaly": False, "normalized_score": 10.0}
+            # Simulate threat intel failure
+            mock_enrich.side_effect = Exception("API connection timed out")
+            
+            body = {
+                "ip": "8.8.8.8",
+                "flow_features": {
+                    "flow_duration": 0.1,
+                    "src_pkts": 2,
+                    "dst_pkts": 2,
+                    "src_bytes": 128,
+                    "dst_bytes": 128,
+                    "pkt_len_mean": 64.0,
+                    "pkt_len_std": 0.0,
+                    "iat_mean": 0.05,
+                    "iat_std": 0.0,
+                    "src_port": 53,
+                    "protocol": "UDP"
+                }
+            }
+            
+            r = client.post("/api/v1/analyze", json=body)
+            assert r.status_code == 200
+            data = r.json()
+            assert data["ip"] == "8.8.8.8"
+            # Threat Intel should fall back to 0.0 rather than adding 28 risk points
+            # RF = 1% malicious (confidence 0.01) -> score = 1.0
+            # IF = normalized 10.0
+            # Intel = None -> 0.0
+            # w1 = 4/7 = 0.571, w2 = 3/7 = 0.429
+            # final = 1 * 0.571 + 10 * 0.429 = 0.571 + 4.29 = 4.86.
+            # Severity Safe / ALLOW
+            assert data["final_score"] <= 10.0
+            # When degraded, severity is DEGRADED if original was SAFE/NORMAL
+            assert data["severity"] in ("SAFE", "NORMAL", "LOW", "DEGRADED")
+            assert data["action"] == "ALLOW"
+            assert data["degraded_mode"] is True
+            assert "trace_id" in data
+            assert "latency_ms" in data

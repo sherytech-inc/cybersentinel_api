@@ -10,7 +10,7 @@ Covers all four edge cases from the architecture spec:
   Case 4: RF=Malicious, IF=high, Intel=95 → Block   (everything agrees)
 """
 import logging
-from typing import Optional
+from typing import Optional, Any
 from app.schemas.decision import (
     Model1Input, Model2Input, Model3Input,
     PredictionLabel, ScoreBreakdown, ThreatSeverity, RecommendedAction,
@@ -32,8 +32,9 @@ def build_explanation(
     model2: Model2Input,
     model3: Optional[Model3Input],
     breakdown: ScoreBreakdown,
-    severity: ThreatSeverity,
-    action: RecommendedAction,
+    severity: Any,
+    action: Any,
+    final_score: float,
 ) -> list[str]:
     """
     Return an ordered list of plain-English explanation strings.
@@ -141,9 +142,10 @@ def build_explanation(
         )
 
     # ── Case-specific summary ─────────────────────────────────────────────────
+    severity_label = getattr(severity, 'value', str(severity))
+    action_label = getattr(action, 'value', str(action))
     lines.append(
-        f"Final score {breakdown.model1_contribution + breakdown.model2_contribution + breakdown.model3_contribution:.1f}/100 "
-        f"→ {severity.value} — recommended action: {action.value}."
+        f"Final score {final_score:.1f}/100 "
+        f"→ {severity_label} — recommended action: {action_label}."
     )
-
     return lines

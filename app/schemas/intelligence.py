@@ -3,6 +3,7 @@ CyberSentinel — Threat Intelligence Schemas
 Stable contract consumed by Model 4 (Decision Engine).
 """
 import re
+from datetime import datetime
 from enum import Enum
 from typing import Optional
 from pydantic import BaseModel, Field, field_validator
@@ -12,6 +13,23 @@ class IntelSeverity(str, Enum):
     LOW = "Low"
     HIGH = "High"
     CRITICAL = "Critical"
+
+class IntelStatus(str, Enum):
+    completed = "completed"
+    partial = "partial"
+    not_configured = "not_configured"
+    not_found = "not_found"
+    quota_exceeded = "quota_exceeded"
+    unavailable = "unavailable"
+    invalid_target = "invalid_target"
+    failed = "failed"
+
+class IntelProviderStatus(str, Enum):
+    completed = "completed"
+    not_configured = "not_configured"
+    not_found = "not_found"
+    quota_exceeded = "quota_exceeded"
+    unavailable = "unavailable"
 
 _IPV4_RE = re.compile(
     r"^((25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)$"
@@ -27,16 +45,6 @@ _PRIVATE_PREFIXES = (
 class IPLookupRequest(BaseModel):
     ip: str = Field(..., examples=["8.8.8.8"])
 
-    @field_validator("ip")
-    @classmethod
-    def validate_ip(cls, v: str) -> str:
-        v = v.strip()
-        if not _IPV4_RE.match(v):
-            raise ValueError(f"'{v}' is not a valid IPv4 address.")
-        if any(v.startswith(p) for p in _PRIVATE_PREFIXES):
-            raise ValueError(f"'{v}' is a private/reserved address.")
-        return v
-
 class BulkIPLookupRequest(BaseModel):
     ips: list[str] = Field(
         ..., 
@@ -45,64 +53,55 @@ class BulkIPLookupRequest(BaseModel):
         examples=[["8.8.8.8", "1.1.1.1"]]
     )
 
-    @field_validator("ips")
-    @classmethod
-    def validate_bulk_ips(cls, v: list[str]) -> list[str]:
-        valid_ips = []
-        for ip in v:
-            valid_ips.append(IPLookupRequest.validate_ip(ip))
-        return valid_ips
+class ProviderState(BaseModel):
+    status: IntelProviderStatus
+    message: Optional[str] = None
 
-class AbuseIPDBResult(BaseModel):
-    abuse_confidence_score: int = Field(0, ge=0, le=100)
-    total_reports: int = 0
-    num_distinct_users: int = 0
-    is_whitelisted: bool = False
-    is_tor: bool = False
-
-class VirusTotalResult(BaseModel):
-    vt_malicious: int = 0
-    vt_suspicious: int = 0
-    vt_harmless: int = 0
-    vt_undetected: int = 0
-    vt_total_engines: int = 0
+class VirusTotalIntelResult(ProviderState):
+    malicious: Optional[int] = None
+    suspicious: Optional[int] = None
+    harmless: Optional[int] = None
+    undetected: Optional[int] = None
+    total_engines: Optional[int] = None
     last_analysis_date: Optional[str] = None
 
-class GeoIPResult(BaseModel):
-    country: str = "Unknown"
-    country_code: str = "XX"
+class AbuseIpDbIntelResult(ProviderState):
+    abuse_confidence_score: Optional[int] = None
+    total_reports: Optional[int] = None
+    num_distinct_users: Optional[int] = None
+    is_whitelisted: Optional[bool] = None
+    is_tor: Optional[bool] = None
+
+class GeoIpIntelResult(ProviderState):
+    country: Optional[str] = None
+    country_code: Optional[str] = None
     city: Optional[str] = None
-    asn: str = "Unknown"
-    organization: str = "Unknown"
+    asn: Optional[str] = None
+    organization: Optional[str] = None
     isp: Optional[str] = None
-    is_proxy: bool = False
-    is_hosting: bool = False
+    is_proxy: Optional[bool] = None
+    is_hosting: Optional[bool] = None
 
 class IntelligenceResponse(BaseModel):
     ip: str
-    abuse_score: int = 0
-    abuse_total_reports: int = 0
-    abuse_distinct_users: int = 0
-    is_tor: bool = False
-    is_whitelisted: bool = False
-    vt_malicious: int = 0
-    vt_suspicious: int = 0
-    vt_harmless: int = 0
-    vt_total_engines: int = 0
-    vt_last_analysis_date: Optional[str] = None
-    country: str = "Unknown"
-    country_code: str = "XX"
-    city: Optional[str] = None
-    asn: str = "Unknown"
-    organization: str = "Unknown"
-    isp: Optional[str] = None
-    is_proxy: bool = False
-    is_hosting: bool = False
-    intel_score: int = Field(0, ge=0, le=100)
-    intel_severity: IntelSeverity = IntelSeverity.SAFE
+    status: IntelStatus
+
+    intel_score: Optional[int] = None
+    severity: Optional[str] = None
+    score_confidence: Optional[str] = None
+    providers_used: list[str] = Field(default_factory=list)
+    providers_queried: list[str] = Field(default_factory=list)
+    providers_available: list[str] = Field(default_factory=list)
+    analysis_status: Optional[str] = None
+
+    virustotal: VirusTotalIntelResult
+    abuseipdb: AbuseIpDbIntelResult
+    geoip: GeoIpIntelResult
+
+    message: str
+    looked_up_at: datetime
+    
     cached: bool = False
-    providers_available: list[str] = []
-    providers_failed: list[str] = []
 
     model_config = {"use_enum_values": True}
 

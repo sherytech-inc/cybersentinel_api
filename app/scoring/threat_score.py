@@ -37,6 +37,8 @@ class ScoringResult:
     breakdown: ScoreBreakdown
 
 
+from app.services.explainability.decision_weights import DecisionWeights
+
 def compute_threat_score(
     model1: Model1Input,
     model2: Model2Input,
@@ -53,7 +55,8 @@ def compute_threat_score(
     m3_raw = _score_model3(model3)
 
     m1_contrib = round(m1_raw * w1, 4)
-    m2_contrib = round(m2_raw * w2, 4)
+    # Apply Isolation Forest contribution cap to protect against calibration drift
+    m2_contrib = min(_cfg.M4_MAX_IF_CONTRIBUTION, round(m2_raw * w2, 4))
     m3_contrib = round(m3_raw * w3, 4)
 
     raw_total = m1_contrib + m2_contrib + m3_contrib
@@ -151,12 +154,20 @@ def _resolve_weights(model3_available: bool) -> tuple[float, float, float]:
     Return (w1, w2, w3). If Model 3 absent, redistribute its weight
     proportionally between Model 1 and Model 2.
     """
-    if model3_available:
-        return _cfg.M4_WEIGHT_MODEL1, _cfg.M4_WEIGHT_MODEL2, _cfg.M4_WEIGHT_MODEL3
+    weights = DecisionWeights()
+    w1_base = weights.random_forest
+    w2_base = weights.isolation_forest
+    w3_base = weights.threat_intelligence
 
-    total = _cfg.M4_WEIGHT_MODEL1 + _cfg.M4_WEIGHT_MODEL2
-    w1 = round(_cfg.M4_WEIGHT_MODEL1 / total, 6)
-    w2 = round(_cfg.M4_WEIGHT_MODEL2 / total, 6)
+    if model3_available:
+        return w1_base, w2_base, w3_base
+
+    total = w1_base + w2_base
+    if total == 0:
+        return 0.5, 0.5, 0.0
+        
+    w1 = round(w1_base / total, 6)
+    w2 = round(w2_base / total, 6)
     logger.warning("Model 3 absent — weights redistributed w1=%.4f w2=%.4f", w1, w2)
     return w1, w2, 0.0
 

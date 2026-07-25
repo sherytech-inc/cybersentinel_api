@@ -10,6 +10,32 @@ from typing import Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field
+from enum import Enum
+
+
+class CaptureDaemonState(str, Enum):
+    STOPPED = "stopped"
+    STARTING = "starting"
+    RUNNING = "running"
+    REPLAY = "replay"
+    STOPPING = "stopping"
+    ERROR = "error"
+
+
+class CaptureStatusResponse(BaseModel):
+    state: CaptureDaemonState
+    interface: Optional[str] = None
+    started_at: Optional[datetime] = None
+    error: Optional[str] = None
+    session_id: Optional[str] = None
+    
+    # Optional fields for backward compatibility with existing stats
+    packets_captured: Optional[int] = None
+    parser: Optional[dict] = None
+    flows: Optional[dict] = None
+    features: Optional[dict] = None
+    config: Optional[dict] = None
+    analysis: Optional[dict] = None
 
 
 class PacketIngestRequest(BaseModel):
@@ -42,6 +68,7 @@ class PacketResponse(BaseModel):
     anomaly_score: Optional[float] = None
     threat_score: Optional[float] = None
     severity: Optional[str] = None
+    flow_features: Optional[dict] = None
     captured_at: Optional[datetime] = None
 
 

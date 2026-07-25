@@ -96,6 +96,7 @@ class Model3Input(BaseModel):
     organization: Optional[str] = None
     is_proxy: bool = False
     is_hosting: bool = False
+    blacklisted: bool = False
 
 
 class AnalyzeRequest(BaseModel):
