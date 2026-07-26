@@ -15,6 +15,7 @@ Incorrect flow aggregation → incorrect features → incorrect predictions.
 """
 
 import asyncio
+import ipaddress
 import logging
 import time
 import uuid
@@ -36,6 +37,13 @@ from app.schemas.decision import Model1Input, Model2Input
 from app.repositories.repositories import PacketRepository
 
 logger = logging.getLogger("cybersentinel.flow_manager")
+
+
+def _is_public_intelligence_target(ip: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip).is_global
+    except ValueError:
+        return False
 
 
 
@@ -466,6 +474,10 @@ class FlowManager:
                 "anomaly_score": analysis_res.model2.anomaly_score,
                 "threat_score": analysis_res.final_score,
                 "action": analysis_res.action,
+                "model3_available": analysis_res.model3_available,
+                "model3_intelligence_score": (
+                    analysis_res.model3_intelligence_score
+                ),
                 "model_results": {
                     "model1": analysis_res.model1.model_dump(),
                     "model2": analysis_res.model2.model_dump(),
@@ -501,38 +513,52 @@ class FlowManager:
                 if ranks.get(severity, 0) >= ranks.get(self._highest_severity or "UNKNOWN", 0):
                     self._highest_severity = severity
         await get_websocket_hub().broadcast("packet_analysis_update", payload)
+        self._debug_stage(
+            flow_id,
+            "event_published",
+            analysis_status=analysis_status,
+            packet_count=len(packet_ids),
+        )
 
     async def _analyze_and_save_flow(
         self, result, fs: dict, packet_ids: list[str], flow_id: str
     ):
-        """Analyze flow features using the unified analyze_flow_internal function and save to Supabase."""
+        """Run authoritative live analysis, publish it, then persist best-effort."""
         try:
-            from app.repositories import ThreatScoreRepository, PacketRepository
             from app.services.intelligence import get_enrichment_service
             from app.api.analyze_routes import analyze_flow_internal
             from app.schemas.analyze import AnalyzeFlowRequest
-            from app.database.client import get_db_client
 
-            if not self._jwt_token or not self._session_id:
-                raise RuntimeError("Authenticated capture token is unavailable")
-            db = await get_db_client(access_token=self._jwt_token)
-
-            threat_repo = ThreatScoreRepository(db)
             intel_service = get_enrichment_service()
-
-            # Prepare AnalyzeFlowRequest
+            analysis_ip = result.external_ip or result.dst_ip
             body = AnalyzeFlowRequest(
-                ip=result.src_ip,
+                ip=analysis_ip,
                 flow_features=result.features.model_dump(),
                 session_id=self._session_id,
             )
-
-            # Route through the unified multi-model pipeline (Model 1, 2, 3, 4, AlertGenerator)
+            self._debug_stage(
+                flow_id,
+                "analysis_started",
+                feature_count=len(body.flow_features),
+                packet_count=len(packet_ids),
+            )
             analysis_res = await analyze_flow_internal(
                 body=body,
                 intel_service=intel_service,
-                threat_repo=threat_repo,
-                client_ip="127.0.0.1"
+                threat_repo=None,
+                client_ip="127.0.0.1",
+                persist_result=False,
+                intel_eligible=_is_public_intelligence_target(analysis_ip),
+            )
+            self._debug_stage(
+                flow_id,
+                "models_completed",
+                analysis_status=analysis_res.analysis_status,
+                model1_status="available",
+                model2_status="available",
+                model3_status=(
+                    "available" if analysis_res.model3_available else "unavailable"
+                ),
             )
             await self._publish_analysis_update(
                 flow_id, packet_ids,
@@ -540,59 +566,18 @@ class FlowManager:
                 severity=analysis_res.severity,
                 analysis_res=analysis_res,
             )
-
-            packet_repo = PacketRepository(db)
-
-            lengths = fs.get("all_packet_lengths", [])
-            avg_size = sum(lengths) // len(lengths) if lengths else 0
-
-            # Calculate fwd and bwd means
-            fwd_lengths = fs.get("fwd_packet_lengths", [])
-            bwd_lengths = fs.get("bwd_packet_lengths", [])
-            fwd_mean = sum(fwd_lengths) / len(fwd_lengths) if fwd_lengths else 0.0
-            bwd_mean = sum(bwd_lengths) / len(bwd_lengths) if bwd_lengths else 0.0
-
-            packet_data = {
-                "session_id": self._session_id,
-                "flow_id": flow_id,
-                "packet_ids": packet_ids[:100],
-                "source_ip": result.src_ip,
-                "destination_ip": result.dst_ip,
-                "source_port": fs.get("src_port"),
-                "destination_port": fs.get("dst_port"),
-                "protocol": fs.get("protocol"),
-                "packet_size": avg_size,
-                "flow_duration": result.features.flow_duration,
-                "fwd_packet_length_mean": round(fwd_mean, 4),
-                "bwd_packet_length_mean": round(bwd_mean, 4),
-                "ml_prediction": analysis_res.model1.classification.capitalize(),
-                "ml_confidence": analysis_res.model1.anomaly_probability,
-                "anomaly_score": analysis_res.model2.anomaly_score,
-                "threat_score": analysis_res.final_score,
-                "severity": analysis_res.severity,
-                "analysis_status": analysis_res.analysis_status,
-                "action": analysis_res.action,
-                "model3_available": analysis_res.model3_available,
-                "model3_intelligence_score": (
-                    analysis_res.model3.intelligence_score
-                    if analysis_res.model3 is not None and hasattr(analysis_res.model3, "intelligence_score")
-                    else None
-                ),
-            }
-
-            inserted_pkt = await packet_repo.insert(packet_data)
-            if inserted_pkt:
-                logger.info(
-                    "Packet saved to Supabase | IP=%s classification=%s score=%.2f",
-                    result.src_ip,
-                    analysis_res.model1.classification,
-                    analysis_res.final_score,
+            try:
+                await self._persist_flow_analysis(
+                    result=result,
+                    flow_snapshot=fs,
+                    packet_ids=packet_ids,
+                    flow_id=flow_id,
+                    analysis_res=analysis_res,
                 )
-            else:
-                key = "packet:not_persisted"
-                if key not in self._reported_analysis_errors:
-                    self._reported_analysis_errors.add(key)
-                    logger.warning("Captured packet records are not being persisted.")
+            except Exception as exc:
+                self._report_persistence_issue(
+                    f"persistence:unexpected:{type(exc).__name__}"
+                )
         except Exception as e:
             key = f"{type(e).__name__}:{e}"
             if key not in self._reported_analysis_errors:
@@ -603,6 +588,154 @@ class FlowManager:
                     e,
                 )
             raise
+
+    def _debug_stage(self, flow_id: str, stage: str, **fields) -> None:
+        if not self._settings.DEBUG:
+            return
+        details = " ".join(f"{key}={value}" for key, value in fields.items())
+        logger.debug("Flow stage | flow_id=%s stage=%s %s", flow_id, stage, details)
+
+    async def _persist_flow_analysis(
+        self,
+        *,
+        result,
+        flow_snapshot: dict,
+        packet_ids: list[str],
+        flow_id: str,
+        analysis_res,
+    ) -> None:
+        """Persist an already-published analysis without affecting live state."""
+        if not self._jwt_token:
+            self._report_persistence_issue("persistence:token_unavailable")
+            return
+        try:
+            from app.database.client import get_db_client
+            db = await get_db_client(access_token=self._jwt_token)
+        except Exception as exc:
+            self._report_persistence_issue(
+                f"persistence:client:{type(exc).__name__}"
+            )
+            return
+
+        self._debug_stage(flow_id, "persistence_started")
+        from app.repositories import (
+            PacketRepository,
+            ThreatAlertRepository,
+            ThreatScoreRepository,
+        )
+
+        threat_repo = ThreatScoreRepository(db)
+        try:
+            await threat_repo.insert({
+                "session_id": self._session_id,
+                "source_ip": result.src_ip,
+                "model1_prediction": analysis_res.model1.classification,
+                "model1_confidence": analysis_res.model1.anomaly_probability,
+                "model2_anomaly_score": analysis_res.model2.anomaly_score,
+                "model3_intel_score": getattr(
+                    analysis_res, "model3_intelligence_score", None
+                ),
+                "threat_score": analysis_res.final_score,
+                "severity": analysis_res.severity,
+                "recommendation": analysis_res.action,
+                "reasoning": analysis_res.explanation,
+                "model3_available": analysis_res.model3_available,
+            })
+        except Exception as exc:
+            self._report_persistence_issue(
+                f"persistence:threat_score:{type(exc).__name__}"
+            )
+
+        lengths = flow_snapshot.get("all_packet_lengths", [])
+        fwd_lengths = flow_snapshot.get("fwd_packet_lengths", [])
+        bwd_lengths = flow_snapshot.get("bwd_packet_lengths", [])
+        packet_data = {
+            "session_id": self._session_id,
+            "flow_id": flow_id,
+            "packet_ids": packet_ids[:100],
+            "source_ip": result.src_ip,
+            "destination_ip": result.dst_ip,
+            "source_port": flow_snapshot.get("src_port"),
+            "destination_port": flow_snapshot.get("dst_port"),
+            "protocol": flow_snapshot.get("protocol"),
+            "packet_size": sum(lengths) // len(lengths) if lengths else 0,
+            "flow_duration": result.features.flow_duration,
+            "fwd_packet_length_mean": (
+                round(sum(fwd_lengths) / len(fwd_lengths), 4)
+                if fwd_lengths else 0.0
+            ),
+            "bwd_packet_length_mean": (
+                round(sum(bwd_lengths) / len(bwd_lengths), 4)
+                if bwd_lengths else 0.0
+            ),
+            "ml_prediction": analysis_res.model1.classification.capitalize(),
+            "ml_confidence": analysis_res.model1.anomaly_probability,
+            "anomaly_score": analysis_res.model2.anomaly_score,
+            "threat_score": analysis_res.final_score,
+            "severity": analysis_res.severity,
+            "analysis_status": analysis_res.analysis_status,
+            "action": analysis_res.action,
+            "model3_available": analysis_res.model3_available,
+            "model3_intelligence_score": getattr(
+                analysis_res, "model3_intelligence_score", None
+            ),
+        }
+        try:
+            inserted = await PacketRepository(db).insert(packet_data)
+            if not inserted:
+                self._report_persistence_issue("persistence:packet:not_saved")
+        except Exception as exc:
+            self._report_persistence_issue(
+                f"persistence:packet:{type(exc).__name__}"
+            )
+
+        if analysis_res.severity in {"HIGH", "CRITICAL"}:
+            try:
+                from app.services.threat_response.alert_generator import AlertGenerator
+                from app.services.threat_response.alert_service import AlertService
+                alert_generator = AlertGenerator(
+                    AlertService(ThreatAlertRepository(db))
+                )
+                await alert_generator.generate_alert({
+                    "source_ip": result.src_ip,
+                    "severity": analysis_res.severity,
+                    "action": analysis_res.action,
+                    "threat_score": analysis_res.final_score,
+                    "explanation": analysis_res.explanation,
+                    "trace_id": analysis_res.trace_id,
+                    "model1_score": (
+                        analysis_res.model1.anomaly_probability * 100
+                    ),
+                    "model2_score": analysis_res.model2.anomaly_score,
+                    "model3_score": (
+                        getattr(
+                            analysis_res, "model3_intelligence_score", None
+                        ) or 0.0
+                    ),
+                    "model1_classification": (
+                        analysis_res.model1.classification
+                    ),
+                    "model2_severity": (
+                        "HIGH" if analysis_res.model2.is_anomaly else "NORMAL"
+                    ),
+                    "model3_severity": (
+                        analysis_res.model3.reputation.upper()
+                        if analysis_res.model3_available and analysis_res.model3
+                        else "UNAVAILABLE"
+                    ),
+                })
+            except Exception as exc:
+                self._report_persistence_issue(
+                    f"persistence:alert:{type(exc).__name__}"
+                )
+
+        self._debug_stage(flow_id, "persistence_finished")
+
+    def _report_persistence_issue(self, key: str) -> None:
+        if key in self._reported_analysis_errors:
+            return
+        self._reported_analysis_errors.add(key)
+        logger.warning("Live analysis persistence unavailable | reason=%s", key)
 
 
     def _cleanup_expired(self):

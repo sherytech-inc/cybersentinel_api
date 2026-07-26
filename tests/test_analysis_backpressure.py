@@ -147,6 +147,8 @@ async def test_ephemeral_session_analysis_does_not_require_workspace(monkeypatch
     result = SimpleNamespace(
         src_ip="192.168.1.10",
         dst_ip="1.1.1.1",
+        external_ip="1.1.1.1",
+        is_internal_only=False,
         features=SimpleNamespace(
             flow_duration=1.0,
             model_dump=lambda: {

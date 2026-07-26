@@ -113,10 +113,13 @@ async def analyze_flow(
 async def analyze_flow_internal(
     body: AnalyzeFlowRequest,
     intel_service: IntelligenceEnrichmentService,
-    threat_repo: ThreatScoreRepository,
-    client_ip: str = "127.0.0.1"
+    threat_repo: Optional[ThreatScoreRepository] = None,
+    client_ip: str = "127.0.0.1",
+    *,
+    persist_result: bool = True,
+    intel_eligible: bool = True,
 ) -> UnifiedAnalyzeResponse:
-    """Internal core orchestrator logic for multi-model threat analysis."""
+    """Run model inference and decisioning, optionally persisting the result."""
     # Explicit timing wrapper start
     start_time = time.time()
     trace_id = str(uuid.uuid4())
@@ -148,7 +151,11 @@ async def analyze_flow_internal(
     
     rf_task = asyncio.to_thread(_model_rf.predict, scaled_m1)
     if_task = asyncio.to_thread(_model_if.predict_raw, flow_features)
-    intel_task = intel_service.enrich(ip)  # Enrichment client handles in-memory TTL caching internally
+    intel_task = (
+        intel_service.enrich(ip)
+        if intel_eligible
+        else asyncio.sleep(0, result=None)
+    )
 
     rf_res, if_res, intel_res = await asyncio.gather(
         rf_task, if_task, intel_task, return_exceptions=True
@@ -336,33 +343,48 @@ async def analyze_flow_internal(
     m2_output = Model2Output(anomaly_score=if_raw_score, is_anomaly=is_anomaly)
 
     # ── 6. Logging & DB Audit Trail ──────────────────────────────────────────
-    try:
-        stored_score = await threat_repo.insert({
-            "session_id": session_id,
-            "source_ip": ip,
-            "model1_prediction": rf_class,
-            "model1_confidence": rf_prob / 100.0,
-            "model2_anomaly_score": if_norm,
-            "model3_intel_score": intel_score if intel_avail else None,
-            "model1_contribution": decision_res.score_breakdown.model1_contribution,
-            "model2_contribution": decision_res.score_breakdown.model2_contribution,
-            "model3_contribution": decision_res.score_breakdown.model3_contribution,
-            "threat_score": final_score,
-            "severity": severity,
-            "recommendation": action,
-            "reasoning": explanation,
-            "model3_available": intel_avail
-        })
-        if stored_score is None:
-            diagnostic_key = "threat_score:not_persisted"
-            if diagnostic_key not in _reported_runtime_diagnostics:
-                _reported_runtime_diagnostics.add(diagnostic_key)
-                logger.warning("Threat score was not persisted.")
-    except Exception as db_exc:
-        logger.error("Audit log DB insert failed | trace_id=%s: %s", trace_id, db_exc)
+    if persist_result and threat_repo is not None:
+        try:
+            stored_score = await threat_repo.insert({
+                "session_id": session_id,
+                "source_ip": ip,
+                "model1_prediction": rf_class,
+                "model1_confidence": rf_prob / 100.0,
+                "model2_anomaly_score": if_norm,
+                "model3_intel_score": intel_score if intel_avail else None,
+                "model1_contribution": (
+                    decision_res.score_breakdown.model1_contribution
+                ),
+                "model2_contribution": (
+                    decision_res.score_breakdown.model2_contribution
+                ),
+                "model3_contribution": (
+                    decision_res.score_breakdown.model3_contribution
+                ),
+                "threat_score": final_score,
+                "severity": severity,
+                "recommendation": action,
+                "reasoning": explanation,
+                "model3_available": intel_avail,
+            })
+            if stored_score is None:
+                diagnostic_key = "threat_score:not_persisted"
+                if diagnostic_key not in _reported_runtime_diagnostics:
+                    _reported_runtime_diagnostics.add(diagnostic_key)
+                    logger.warning("Threat score was not persisted.")
+        except Exception as db_exc:
+            logger.error(
+                "Audit log DB insert failed | trace_id=%s type=%s",
+                trace_id,
+                type(db_exc).__name__,
+            )
 
     # ── 7. Phase 7 — Alert Generator Hook ─────────────────────────────────────
-    if severity in ("HIGH", "CRITICAL"):
+    if (
+        persist_result
+        and threat_repo is not None
+        and severity in ("HIGH", "CRITICAL")
+    ):
         try:
             alert_repo = ThreatAlertRepository(threat_repo._db)
             alert_service = AlertService(alert_repo)
@@ -403,6 +425,7 @@ async def analyze_flow_internal(
         model2=m2_output,
         model3=model3_block,
         model3_available=intel_avail,
+        model3_intelligence_score=intel_score if intel_avail else None,
         final_score=round(final_score, 2),
         severity=severity,
         action=action,

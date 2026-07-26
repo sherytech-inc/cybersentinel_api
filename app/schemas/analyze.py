@@ -80,6 +80,12 @@ class UnifiedAnalyzeResponse(BaseModel):
     model2: Model2Output
     model3: Optional[Model3Output] = None
     model3_available: bool = Field(..., description="True if external threat intelligence enrichment was reachable")
+    model3_intelligence_score: Optional[float] = Field(
+        None,
+        ge=0.0,
+        le=100.0,
+        description="Normalized intelligence score when Model 3 is available",
+    )
     final_score: float = Field(..., ge=0.0, le=100.0, description="Weighted composite risk score")
     severity: str = Field(..., description="LOW | MEDIUM | HIGH | CRITICAL")
     action: str = Field(..., description="ALLOW | MONITOR | ALERT | BLOCK")

@@ -1,33 +1,27 @@
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 from types import SimpleNamespace
 
 import pytest
 
-from app.api.capture_routes import StartCaptureRequest, start_capture
 from app.api.packet_routes import (
     StartCaptureRequest as ApiStartCaptureRequest,
     capture_start as api_capture_start,
 )
+from app.main import app
 
 
-@pytest.mark.asyncio
-async def test_start_capture_accepts_interface_contract():
-    capture_service = AsyncMock()
-
-    with patch(
-        "app.api.capture_routes.get_capture_service",
-        return_value=capture_service,
-    ):
-        response = await start_capture(
-            StartCaptureRequest(interface="en0"),
-            SimpleNamespace(headers={"authorization": "Bearer verified-jwt"}),
-        )
-
-    capture_service.start_live.assert_awaited_once_with(
-        interface="en0",
-        jwt_token="verified-jwt",
-    )
-    assert response["status"] == "success"
+def test_capture_control_paths_have_one_canonical_handler_each():
+    control_paths = {
+        "/api/v1/capture/start",
+        "/api/v1/capture/stop",
+        "/api/v1/capture/replay",
+    }
+    registered = [
+        route.path
+        for route in app.routes
+        if route.path in control_paths and "POST" in (route.methods or set())
+    ]
+    assert sorted(registered) == sorted(control_paths)
 
 
 @pytest.mark.asyncio
