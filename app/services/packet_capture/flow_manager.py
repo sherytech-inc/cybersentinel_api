@@ -698,8 +698,16 @@ class FlowManager:
                 )
                 await alert_generator.generate_alert({
                     "source_ip": result.src_ip,
+                    "destination_ip": result.dst_ip,
+                    "source_port": flow_snapshot.get("src_port"),
+                    "destination_port": flow_snapshot.get("dst_port"),
+                    "protocol": flow_snapshot.get("protocol"),
+                    "flow_id": flow_id,
+                    "session_id": self._session_id,
                     "severity": analysis_res.severity,
                     "action": analysis_res.action,
+                    "analysis_status": analysis_res.analysis_status,
+                    "local_models_available": True,
                     "threat_score": analysis_res.final_score,
                     "explanation": analysis_res.explanation,
                     "trace_id": analysis_res.trace_id,
@@ -710,7 +718,7 @@ class FlowManager:
                     "model3_score": (
                         getattr(
                             analysis_res, "model3_intelligence_score", None
-                        ) or 0.0
+                        )
                     ),
                     "model1_classification": (
                         analysis_res.model1.classification

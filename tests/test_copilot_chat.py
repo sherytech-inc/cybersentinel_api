@@ -210,6 +210,104 @@ async def test_context_exposes_latest_completed_ephemeral_flow(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_context_includes_bounded_real_alerts_and_enforcement_results(
+    monkeypatch,
+):
+    class Capture:
+        flow_manager = type(
+            "FlowManager",
+            (),
+            {"get_recent_completed": lambda self, limit: []},
+        )()
+
+        def get_status(self):
+            return {
+                "state": "running",
+                "interface": "en0",
+                "packets_captured": 20,
+                "analysis": {"analyzed_packets": 10, "pending_packets": 10},
+            }
+
+    class Query:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def select(self, *_): return self
+        def eq(self, *_): return self
+        def order(self, *_, **__): return self
+        def limit(self, *_): return self
+        async def execute(self):
+            return type("Result", (), {"data": self.rows})()
+
+    class DB:
+        def table(self, name):
+            if name == "threat_alerts":
+                return Query(
+                    [
+                        {
+                            "alert_id": "alert-1",
+                            "source_ip": "198.51.100.8",
+                            "severity": "HIGH",
+                            "status": "INVESTIGATING",
+                            "action": "INVESTIGATE",
+                            "threat_score": 82.0,
+                            "summary": "Suspicious flow",
+                            "model1_classification": "Suspicious",
+                            "model1_score": 0.91,
+                            "model2_score": 88.0,
+                            "model3_score": None,
+                            "timeline": [
+                                {
+                                    "event": "CREATED",
+                                    "context": {
+                                        "flow_id": "flow-1",
+                                        "analysis_status": "partial",
+                                    },
+                                }
+                            ],
+                            "created_at": "2026-07-26T00:00:00Z",
+                            "updated_at": "2026-07-26T00:01:00Z",
+                        }
+                    ]
+                )
+            if name == "audit_logs":
+                return Query(
+                    [
+                        {
+                            "id": "action-1",
+                            "resource_id": "alert-1",
+                            "ip_address": "198.51.100.8",
+                            "action": "BLOCK",
+                            "payload": {
+                                "recorded": True,
+                                "enforced": False,
+                                "status": "RECORDED_ONLY",
+                                "result": "recorded_only",
+                            },
+                            "created_at": "2026-07-26T00:02:00Z",
+                        }
+                    ]
+                )
+            return Query([])
+
+    monkeypatch.setattr(
+        "app.services.chatbot.context_builder.get_capture_service",
+        lambda: Capture(),
+    )
+    context = await ContextBuilder().build(
+        DB(),
+        "EXPLAIN_ALERT",
+        "Was this IP actually blocked?",
+    )
+    assert len(context["recent_alerts"]) == 1
+    assert context["open_alerts"][0]["alert_id"] == "alert-1"
+    assert context["open_alerts"][0]["flow_id"] == "flow-1"
+    assert context["recent_response_actions"][0]["enforced"] is False
+    assert context["recent_response_actions"][0]["status"] == "RECORDED_ONLY"
+    assert len(context["recent_alerts"]) <= ContextBuilder.ALERT_LIMIT
+
+
+@pytest.mark.asyncio
 async def test_llm_timeout_and_rate_limit_mapping(monkeypatch):
     settings = get_settings()
     monkeypatch.setattr(settings, "GROQ_API_KEY", "configured-for-test")

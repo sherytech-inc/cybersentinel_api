@@ -31,6 +31,13 @@ class ThreatQueueItem(BaseModel):
     model1_classification: Optional[str] = None
     model2_severity: Optional[str] = None
     model3_severity: Optional[str] = None
+    flow_id: Optional[str] = None
+    session_id: Optional[str] = None
+    destination_ip: Optional[str] = None
+    source_port: Optional[int] = None
+    destination_port: Optional[int] = None
+    protocol: Optional[str] = None
+    analysis_status: Optional[str] = None
     occurrence_count: int
     created_at: datetime
     updated_at: datetime
@@ -64,6 +71,7 @@ class ThreatQueueResponse(BaseModel):
 class ResponseBlockRequest(BaseModel):
     ip: str = Field(..., examples=["185.220.101.45"])
     reason: Optional[str] = Field(None, examples=["Malicious activity detected"])
+    alert_id: Optional[str] = None
 
 
 class ResponseActionResult(BaseModel):
@@ -73,6 +81,7 @@ class ResponseActionResult(BaseModel):
     reason: Optional[str] = None
     analyst_name: Optional[str] = None
     note: Optional[str] = None
+    related_alert: Optional[str] = None
     status: str
     created_at: datetime
     recorded: bool = True

@@ -536,7 +536,6 @@ class ThreatAlertRepository(BaseRepository):
             for row in rows:
                 sev = row.get("severity")
                 stat = row.get("status")
-                act = row.get("action")
 
                 if sev == "CRITICAL":
                     stats["critical_alerts"] += 1
@@ -553,15 +552,20 @@ class ThreatAlertRepository(BaseRepository):
                 elif stat == "FALSE_POSITIVE":
                     stats["false_positives"] += 1
 
-                if act == "BLOCK":
-                    stats["blocked_alerts"] += 1
+                # `action` is a recommendation, not proof of OS enforcement.
 
             return stats
         except Exception as exc:
             logger.exception("get_stats failed: %s", exc)
             return {}
 
-    async def increment_occurrence(self, alert_id: str, updated_fields: dict) -> Optional[dict]:
+    async def increment_occurrence(
+        self,
+        alert_id: str,
+        updated_fields: dict,
+        *,
+        identity: Optional[dict] = None,
+    ) -> Optional[dict]:
         try:
             existing = await self.get_by_id(alert_id)
             if not existing:
@@ -577,7 +581,8 @@ class ThreatAlertRepository(BaseRepository):
                 "event": "DUPLICATE_OCCURRENCE",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "occurrence_number": count,
-                "threat_score": updated_fields.get("threat_score")
+                "threat_score": updated_fields.get("threat_score"),
+                "context": identity or {},
             })
 
             data = {
@@ -591,23 +596,87 @@ class ThreatAlertRepository(BaseRepository):
             logger.exception("increment_occurrence failed for alert_id=%s: %s", alert_id, exc)
             return None
 
-    async def find_active_alert_by_ip(self, ip: str, timeframe_seconds: int) -> Optional[dict]:
+    async def find_active_alert(
+        self,
+        *,
+        source_ip: str,
+        threat_type: str,
+        flow_id: Optional[str],
+        session_id: Optional[str],
+        timeframe_seconds: int,
+    ) -> Optional[dict]:
+        """Find only a matching active occurrence, not merely the same IP."""
         try:
             cutoff = (datetime.now(timezone.utc) - timedelta(seconds=timeframe_seconds)).isoformat()
             result = (
                 await self._db.table(self._table)
                 .select("*")
-                .eq("source_ip", ip)
+                .eq("source_ip", source_ip)
                 .in_("status", ["OPEN", "INVESTIGATING"])
                 .gte("updated_at", cutoff)
                 .order("updated_at", desc=True)
-                .limit(1)
+                .limit(20)
                 .execute()
             )
-            return result.data[0] if result.data else None
+            candidates = result.data or []
+
+            def identities(row: dict) -> list[dict]:
+                timeline = row.get("timeline")
+                if not isinstance(timeline, list):
+                    return []
+                return [
+                    event.get("context")
+                    for event in timeline
+                    if isinstance(event, dict)
+                    and isinstance(event.get("context"), dict)
+                ]
+
+            if flow_id:
+                return next(
+                    (
+                        row
+                        for row in candidates
+                        if any(
+                            str(context.get("flow_id") or "") == str(flow_id)
+                            for context in identities(row)
+                        )
+                    ),
+                    None,
+                )
+            if session_id:
+                return next(
+                    (
+                        row
+                        for row in candidates
+                        if any(
+                            str(context.get("session_id") or "")
+                            == str(session_id)
+                            for context in identities(row)
+                        )
+                        and str(
+                            row.get("model1_classification") or "unknown"
+                        ).lower()
+                        == threat_type
+                    ),
+                    None,
+                )
+            return next(
+                (
+                    row
+                    for row in candidates
+                    if str(
+                        row.get("model1_classification") or "unknown"
+                    ).lower()
+                    == threat_type
+                ),
+                None,
+            )
         except Exception as exc:
-            logger.exception("find_active_alert_by_ip failed for ip=%s: %s", ip, exc)
-            return None
+            logger.warning(
+                "Active alert lookup unavailable | type=%s",
+                type(exc).__name__,
+            )
+            raise RuntimeError("active_alert_lookup_unavailable") from exc
 
 
 # ─────────────────────────────────────────────────────────────────────────────

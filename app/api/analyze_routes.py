@@ -392,22 +392,34 @@ async def analyze_flow_internal(
             
             alert_decision_data = {
                 "source_ip": ip,
+                "session_id": session_id,
                 "severity": severity,
                 "action": action,
+                "analysis_status": analysis_status,
+                "local_models_available": not local_model_failed,
                 "threat_score": final_score,
                 "explanation": explanation,
                 "trace_id": trace_id,
                 "model1_score": rf_prob,
                 "model2_score": if_norm,
-                "model3_score": intel_score if intel_avail else 0.0,
+                "model3_score": intel_score if intel_avail else None,
                 "model1_classification": rf_class,
                 "model2_severity": "HIGH" if is_anomaly else "NORMAL",
-                "model3_severity": intel_severity.upper() if intel_avail else "SAFE",
+                "model3_severity": (
+                    intel_severity.upper() if intel_avail else "UNAVAILABLE"
+                ),
             }
-            await alert_gen.generate_alert(alert_decision_data)
-            logger.info("Threat alert generated/updated successfully for IP %s", ip)
+            alert = await alert_gen.generate_alert(alert_decision_data)
+            if alert:
+                logger.info(
+                    "Threat alert generated or updated | alert_id=%s",
+                    alert.get("alert_id"),
+                )
         except Exception as alert_exc:
-            logger.exception("Failed to generate/update threat alert: %s", alert_exc)
+            logger.warning(
+                "Threat alert persistence unavailable | type=%s",
+                type(alert_exc).__name__,
+            )
 
     # Explicit timing wrapper end
     latency_ms = (time.time() - start_time) * 1000

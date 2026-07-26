@@ -7,11 +7,11 @@ Backend firewall enforcement logic will be added in a future phase.
 """
 
 import logging
-from uuid import uuid4
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
+from app.api.auth_dependencies import get_current_analyst
 from app.repositories import get_firewall_action_repo
 from app.repositories.repositories import FirewallActionRepository
 from app.schemas.firewall_action import (
@@ -21,7 +21,11 @@ from app.schemas.firewall_action import (
 )
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/v1/firewall-action", tags=["Firewall Actions"])
+router = APIRouter(
+    prefix="/api/v1/firewall-action",
+    tags=["Firewall Actions"],
+    dependencies=[Depends(get_current_analyst)],
+)
 
 
 async def _perform_action(
@@ -47,14 +51,9 @@ async def _perform_action(
             source=row.get("source", source),
             created_at=row.get("created_at", datetime.now(timezone.utc)),
         )
-    # Fallback if DB insert fails — still return a valid response
-    return FirewallActionResponse(
-        id=uuid4(),
-        ip=request.ip,
-        action=action,
-        reason=request.reason,
-        source=source,
-        created_at=datetime.now(timezone.utc),
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="firewall_action_storage_unavailable",
     )
 
 

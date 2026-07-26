@@ -5,6 +5,33 @@ from app.repositories.repositories import ThreatAlertRepository
 
 logger = logging.getLogger("cybersentinel.services.alert_service")
 
+
+ALERT_STORAGE_FIELDS = {
+    "source_ip",
+    "severity",
+    "action",
+    "threat_score",
+    "summary",
+    "explanation",
+    "trace_id",
+    "model1_score",
+    "model2_score",
+    "model3_score",
+    "model1_classification",
+    "model2_severity",
+    "model3_severity",
+}
+ALERT_IDENTITY_FIELDS = (
+    "flow_id",
+    "session_id",
+    "destination_ip",
+    "source_port",
+    "destination_port",
+    "protocol",
+    "analysis_status",
+)
+
+
 class AlertService:
     def __init__(self, repo: ThreatAlertRepository, duplicate_timeframe_minutes: int = 60) -> None:
         self.repo = repo
@@ -21,74 +48,70 @@ class AlertService:
         if not ip:
             raise ValueError("Alert data must contain source_ip")
 
+        identity = {
+            key: alert_data.get(key)
+            for key in ALERT_IDENTITY_FIELDS
+            if alert_data.get(key) is not None
+        }
+        threat_type = str(
+            alert_data.get("model1_classification") or "unknown"
+        ).lower()
         timeframe_seconds = self.duplicate_timeframe_minutes * 60
-        existing_alert = await self.repo.find_active_alert_by_ip(ip, timeframe_seconds)
+        existing_alert = await self.repo.find_active_alert(
+            source_ip=ip,
+            threat_type=threat_type,
+            flow_id=identity.get("flow_id"),
+            session_id=identity.get("session_id"),
+            timeframe_seconds=timeframe_seconds,
+        )
 
         if existing_alert:
             alert_id = existing_alert["alert_id"]
-            logger.info("Duplicate alert detected for IP %s. Merging into alert_id=%s", ip, alert_id)
+            logger.info(
+                "Matching alert occurrence found | alert_id=%s",
+                alert_id,
+            )
             
-            # Fields to update
             updated_fields = {
-                "threat_score": alert_data["threat_score"],
-                "severity": alert_data["severity"],
-                "action": alert_data["action"],
-                "summary": alert_data["summary"],
-                "explanation": alert_data["explanation"],
-                "trace_id": alert_data.get("trace_id"),
-                "model1_score": alert_data.get("model1_score"),
-                "model2_score": alert_data.get("model2_score"),
-                "model3_score": alert_data.get("model3_score"),
-                "model1_classification": alert_data.get("model1_classification"),
-                "model2_severity": alert_data.get("model2_severity"),
-                "model3_severity": alert_data.get("model3_severity"),
+                key: value
+                for key, value in alert_data.items()
+                if key in ALERT_STORAGE_FIELDS
             }
             
-            result = await self.repo.increment_occurrence(alert_id, updated_fields)
+            result = await self.repo.increment_occurrence(
+                alert_id,
+                updated_fields,
+                identity=identity,
+            )
             
             if result:
-                try:
-                    from app.services.websocket.connection_manager import get_websocket_hub
-                    hub = get_websocket_hub()
-                    await hub.broadcast("alert_updated", {
-                        "alert_id": result["alert_id"],
-                        "source_ip": result["source_ip"],
-                        "severity": result["severity"],
-                        "action": result["action"],
-                        "status": result["status"],
-                        "threat_score": result["threat_score"],
-                        "summary": result["summary"],
-                        "explanation": result["explanation"],
-                        "occurrence_count": result["occurrence_count"],
-                        "timeline": result["timeline"],
-                        "created_at": result["created_at"],
-                        "updated_at": result["updated_at"]
-                    })
-                    # Send stats_update immediately
-                    from app.services.threat_response.stats_service import get_full_dashboard_stats
-                    stats = await get_full_dashboard_stats()
-                    await hub.broadcast("stats_update", stats)
-                    await hub.broadcast("analytics_updated", {})
-                except Exception as ws_exc:
-                    logger.error("Failed to broadcast alert_updated event: %s", ws_exc)
+                await self._broadcast_alert("alert_updated", result)
 
             return result or existing_alert
 
         else:
-            # Create a fresh alert
-            logger.info("No active alert found for IP %s. Inserting new alert.", ip)
+            logger.info("Creating a new genuine threat alert.")
             now_iso = datetime.now(timezone.utc).isoformat()
             
             initial_timeline = [
                 {
                     "event": "CREATED",
                     "timestamp": now_iso,
-                    "notes": f"Threat detected. Severity: {alert_data['severity']}, Recommendation: {alert_data['action']}"
+                    "notes": (
+                        "Threat detected. "
+                        f"Severity: {alert_data['severity']}, "
+                        f"Recommendation: {alert_data['action']}"
+                    ),
+                    "context": identity,
                 }
             ]
             
             full_alert = {
-                **alert_data,
+                **{
+                    key: value
+                    for key, value in alert_data.items()
+                    if key in ALERT_STORAGE_FIELDS
+                },
                 "status": "OPEN",
                 "occurrence_count": 1,
                 "timeline": initial_timeline,
@@ -101,32 +124,62 @@ class AlertService:
             if not result:
                 raise RuntimeError("Failed to insert alert into repository")
 
-            try:
-                from app.services.websocket.connection_manager import get_websocket_hub
-                hub = get_websocket_hub()
-                await hub.broadcast("new_threat", {
-                    "alert_id": result["alert_id"],
-                    "source_ip": result["source_ip"],
-                    "severity": result["severity"],
-                    "action": result["action"],
-                    "status": result["status"],
-                    "threat_score": result["threat_score"],
-                    "summary": result["summary"],
-                    "explanation": result["explanation"],
-                    "occurrence_count": result["occurrence_count"],
-                    "timeline": result["timeline"],
-                    "created_at": result["created_at"],
-                    "updated_at": result["updated_at"]
-                })
-                # Send stats_update immediately
-                from app.services.threat_response.stats_service import get_full_dashboard_stats
-                stats = await get_full_dashboard_stats()
-                await hub.broadcast("stats_update", stats)
-                await hub.broadcast("analytics_updated", {})
-            except Exception as ws_exc:
-                logger.error("Failed to broadcast new_threat event: %s", ws_exc)
+            await self._broadcast_alert("new_threat", result)
 
             return result
+
+    @staticmethod
+    def extract_identity(alert: dict) -> dict:
+        """Return the latest supported flow/session evidence from timeline JSON."""
+        timeline = alert.get("timeline")
+        if not isinstance(timeline, list):
+            return {}
+        for event in reversed(timeline):
+            if not isinstance(event, dict):
+                continue
+            context = event.get("context")
+            if isinstance(context, dict):
+                return {
+                    key: context.get(key)
+                    for key in ALERT_IDENTITY_FIELDS
+                    if context.get(key) is not None
+                }
+        return {}
+
+    async def _broadcast_alert(self, event_name: str, alert: dict) -> None:
+        try:
+            from app.services.websocket.connection_manager import (
+                get_websocket_hub,
+            )
+
+            hub = get_websocket_hub()
+            identity = self.extract_identity(alert)
+            payload = {
+                "alert_id": alert.get("alert_id"),
+                "source_ip": alert.get("source_ip"),
+                "severity": alert.get("severity"),
+                "action": alert.get("action"),
+                "status": alert.get("status"),
+                "threat_score": alert.get("threat_score"),
+                "summary": alert.get("summary"),
+                "explanation": alert.get("explanation") or [],
+                "model1_classification": alert.get("model1_classification"),
+                "model1_score": alert.get("model1_score"),
+                "model2_score": alert.get("model2_score"),
+                "model3_score": alert.get("model3_score"),
+                "occurrence_count": alert.get("occurrence_count", 1),
+                "timeline": alert.get("timeline") or [],
+                "created_at": alert.get("created_at"),
+                "updated_at": alert.get("updated_at"),
+                **identity,
+            }
+            await hub.broadcast(event_name, payload)
+            await hub.broadcast("analytics_updated", {})
+        except Exception as exc:
+            logger.warning(
+                "Alert event publication unavailable | type=%s",
+                type(exc).__name__,
+            )
 
     async def update_status(self, alert_id: str, new_status: str, notes: Optional[str] = None) -> Optional[dict]:
         """
@@ -147,23 +200,11 @@ class AlertService:
         updated = await self.repo.update_status(alert_id, status_upper, timeline_event)
         
         if updated:
-            try:
-                from app.services.websocket.connection_manager import get_websocket_hub
-                hub = get_websocket_hub()
-                
-                event_name = "alert_resolved" if status_upper in ("RESOLVED", "FALSE_POSITIVE") else "alert_updated"
-                await hub.broadcast(event_name, {
-                    "alert_id": alert_id,
-                    "status": status_upper,
-                    "timeline": updated["timeline"],
-                    "updated_at": updated["updated_at"]
-                })
-                # Send stats_update immediately
-                from app.services.threat_response.stats_service import get_full_dashboard_stats
-                stats = await get_full_dashboard_stats()
-                await hub.broadcast("stats_update", stats)
-                await hub.broadcast("analytics_updated", {})
-            except Exception as ws_exc:
-                logger.error("Failed to broadcast alert update status event: %s", ws_exc)
+            event_name = (
+                "alert_resolved"
+                if status_upper in ("RESOLVED", "FALSE_POSITIVE")
+                else "alert_updated"
+            )
+            await self._broadcast_alert(event_name, updated)
 
         return updated

@@ -20,7 +20,11 @@ from app.repositories import (
     get_virus_repo,
     get_threat_alert_repo,
 )
-from app.api.auth_dependencies import require_admin
+from app.api.auth_dependencies import (
+    AnalystIdentity,
+    get_current_analyst,
+    require_admin,
+)
 from app.repositories.repositories import (
     PacketRepository,
     FirewallLogRepository,
@@ -89,6 +93,7 @@ async def list_firewall_logs(
 
 def format_alert_response(alert: dict) -> dict:
     """Ensure backward compatibility with threat_score UI expectations."""
+    identity = AlertService.extract_identity(alert)
     # Wrap our summary in a single-item list as the reasoning field expected by older providers
     reasoning = [alert.get("summary", "No details available.")]
 
@@ -103,6 +108,13 @@ def format_alert_response(alert: dict) -> dict:
         "summary": alert.get("summary"),
         "explanation": alert.get("explanation") or [],
         "trace_id": alert.get("trace_id"),
+        "flow_id": identity.get("flow_id"),
+        "session_id": identity.get("session_id"),
+        "destination_ip": identity.get("destination_ip"),
+        "source_port": identity.get("source_port"),
+        "destination_port": identity.get("destination_port"),
+        "protocol": identity.get("protocol"),
+        "analysis_status": identity.get("analysis_status"),
         "model1_score": alert.get("model1_score"),
         "model2_score": alert.get("model2_score"),
         "model3_score": alert.get("model3_score"),
@@ -128,6 +140,7 @@ async def list_threats(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     repo: ThreatAlertRepository = Depends(get_threat_alert_repo),
+    _analyst: AnalystIdentity = Depends(get_current_analyst),
 ):
     """Fetch paginated threat alerts."""
     rows, total = await repo.get_all(page=page, page_size=page_size)
@@ -140,6 +153,7 @@ async def list_open_threats(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     repo: ThreatAlertRepository = Depends(get_threat_alert_repo),
+    _analyst: AnalystIdentity = Depends(get_current_analyst),
 ):
     """Fetch alerts that are currently active (OPEN or INVESTIGATING)."""
     rows, total = await repo.get_history(status="OPEN", page=page, page_size=page_size)
@@ -173,6 +187,7 @@ async def threat_history(
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
     repo: ThreatAlertRepository = Depends(get_threat_alert_repo),
+    _analyst: AnalystIdentity = Depends(get_current_analyst),
 ):
     """Full paginated threat history with robust operational filters."""
     sanitized = AlertFilters.sanitize_history_params(
@@ -201,6 +216,7 @@ async def list_high_threats(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     repo: ThreatAlertRepository = Depends(get_threat_alert_repo),
+    _analyst: AnalystIdentity = Depends(get_current_analyst),
 ):
     """Fetch high-severity alerts (HIGH and CRITICAL)."""
     rows, total = await repo.get_by_severity(["HIGH", "CRITICAL"], page=page, page_size=page_size)
@@ -213,6 +229,7 @@ async def list_critical_threats(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     repo: ThreatAlertRepository = Depends(get_threat_alert_repo),
+    _analyst: AnalystIdentity = Depends(get_current_analyst),
 ):
     """Fetch critical-severity alerts (CRITICAL only)."""
     rows, total = await repo.get_by_severity(["CRITICAL"], page=page, page_size=page_size)
@@ -223,6 +240,7 @@ async def list_critical_threats(
 @router.get("/threats/stats")
 async def get_threat_stats(
     repo: ThreatAlertRepository = Depends(get_threat_alert_repo),
+    _analyst: AnalystIdentity = Depends(get_current_analyst),
 ):
     """Get active, severity, and status counts for threat alerts."""
     return await repo.get_stats()
@@ -232,6 +250,7 @@ async def get_threat_stats(
 async def get_investigation_record(
     alert_id: str,
     repo: ThreatAlertRepository = Depends(get_threat_alert_repo),
+    _analyst: AnalystIdentity = Depends(get_current_analyst),
 ):
     """Fetch a single comprehensive alert record for SOC investigation."""
     alert = await repo.get_by_id(alert_id)
@@ -248,6 +267,7 @@ async def update_lifecycle_status(
     alert_id: str,
     payload: ThreatAlertStatusUpdate,
     repo: ThreatAlertRepository = Depends(get_threat_alert_repo),
+    _analyst: AnalystIdentity = Depends(get_current_analyst),
 ):
     """Update lifecycle status of a threat alert and log transition to timeline."""
     service = AlertService(repo)

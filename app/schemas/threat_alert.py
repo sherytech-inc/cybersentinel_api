@@ -12,6 +12,13 @@ class ThreatAlertResponse(BaseModel):
     summary: str
     explanation: list[str]  # JSONB array
     trace_id: Optional[str] = None
+    flow_id: Optional[str] = None
+    session_id: Optional[str] = None
+    destination_ip: Optional[str] = None
+    source_port: Optional[int] = None
+    destination_port: Optional[int] = None
+    protocol: Optional[str] = None
+    analysis_status: Optional[str] = None
     
     # Model scores
     model1_score: Optional[float] = None

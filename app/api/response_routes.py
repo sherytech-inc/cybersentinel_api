@@ -7,7 +7,7 @@ REST API for SOC actions and threat queue management (Phase 8).
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from app.repositories import get_firewall_action_repo, get_threat_alert_repo
@@ -33,7 +33,11 @@ async def get_analyst_note_repo(db=Depends(get_db_client)):
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/v1/response", tags=["Threat Response Center — Phase 8"])
+router = APIRouter(
+    prefix="/api/v1/response",
+    tags=["Threat Response Center — Phase 8"],
+    dependencies=[Depends(get_current_analyst)],
+)
 
 
 class ThreatActionNotes(BaseModel):
@@ -74,12 +78,13 @@ async def get_threats(
 @router.post("/threats/{alert_id}/investigate", response_model=dict)
 async def investigate_threat(
     alert_id: str,
-    service: ResponseService = Depends(get_response_service)
+    analyst: AnalystIdentity = Depends(get_current_analyst),
+    service: ResponseService = Depends(get_response_service),
 ):
-    updated = await service.investigate_threat(alert_id)
+    updated = await service.investigate_threat(alert_id, analyst.user_id)
     if not updated:
         raise HTTPException(status_code=404, detail="Alert not found")
-    return {"status": "success", "alert_id": alert_id}
+    return {"status": "success", "alert_id": alert_id, "alert": updated}
 
 
 @router.get("/threats/{alert_id}/explanation", response_model=dict)
@@ -158,7 +163,7 @@ async def resolve_threat(
     updated = await service.resolve_threat(alert_id, analyst.user_id, body.notes)
     if not updated:
         raise HTTPException(status_code=404, detail="Alert not found")
-    return {"status": "success", "alert_id": alert_id}
+    return {"status": "success", "alert_id": alert_id, "alert": updated}
 
 
 @router.post("/threats/{alert_id}/ignore", response_model=dict)
@@ -171,7 +176,7 @@ async def ignore_threat(
     updated = await service.ignore_threat(alert_id, analyst.user_id, body.notes)
     if not updated:
         raise HTTPException(status_code=404, detail="Alert not found")
-    return {"status": "success", "alert_id": alert_id}
+    return {"status": "success", "alert_id": alert_id, "alert": updated}
 
 
 @router.post("/block", response_model=ResponseActionResult)
@@ -180,20 +185,29 @@ async def block_ip(
     analyst: AnalystIdentity = Depends(get_current_analyst),
     service: ResponseService = Depends(get_response_service)
 ):
-    action = await service.block_ip(request.ip, analyst.user_id, request.reason)
+    args = (request.ip, analyst.user_id, request.reason)
+    action = (
+        await service.block_ip(*args, request.alert_id)
+        if request.alert_id
+        else await service.block_ip(*args)
+    )
     if not action:
-        raise HTTPException(status_code=500, detail="Failed to block IP")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="response_action_unavailable",
+        )
     
     return {
         "id": action.get("id", ""),
         "ip": action.get("ip", ""),
         "action": action.get("action", ""),
         "reason": action.get("reason"),
-        "status": action.get("status", "SUCCESS"),
+        "status": action.get("status", "RECORDED_ONLY"),
         "created_at": action.get("created_at"),
-        "recorded": True,
-        "enforced": False,
-        "message": "Action recorded but not enforced at OS level."
+        "recorded": action.get("recorded", True),
+        "enforced": action.get("enforced", False),
+        "message": action.get("message"),
+        "related_alert": action.get("related_alert"),
     }
 
 
@@ -203,20 +217,61 @@ async def unblock_ip(
     analyst: AnalystIdentity = Depends(get_current_analyst),
     service: ResponseService = Depends(get_response_service)
 ):
-    action = await service.unblock_ip(request.ip, analyst.user_id, request.reason)
+    args = (request.ip, analyst.user_id, request.reason)
+    action = (
+        await service.unblock_ip(*args, request.alert_id)
+        if request.alert_id
+        else await service.unblock_ip(*args)
+    )
     if not action:
-        raise HTTPException(status_code=500, detail="Failed to unblock IP")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="response_action_unavailable",
+        )
     
     return {
         "id": action.get("id", ""),
         "ip": action.get("ip", ""),
         "action": action.get("action", ""),
         "reason": action.get("reason"),
-        "status": action.get("status", "SUCCESS"),
+        "status": action.get("status", "RECORDED_ONLY"),
         "created_at": action.get("created_at"),
-        "recorded": True,
-        "enforced": False,
-        "message": "Action recorded but not enforced at OS level."
+        "recorded": action.get("recorded", True),
+        "enforced": action.get("enforced", False),
+        "message": action.get("message"),
+        "related_alert": action.get("related_alert"),
+    }
+
+
+@router.post("/whitelist", response_model=ResponseActionResult)
+async def whitelist_ip(
+    request: ResponseBlockRequest,
+    analyst: AnalystIdentity = Depends(get_current_analyst),
+    service: ResponseService = Depends(get_response_service),
+):
+    args = (request.ip, analyst.user_id, request.reason)
+    action = (
+        await service.whitelist_ip(*args, request.alert_id)
+        if request.alert_id
+        else await service.whitelist_ip(*args)
+    )
+    if not action:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="response_action_unavailable",
+        )
+
+    return {
+        "id": action.get("id", ""),
+        "ip": action.get("ip", ""),
+        "action": action.get("action", ""),
+        "reason": action.get("reason"),
+        "status": action.get("status", "RECORDED_ONLY"),
+        "created_at": action.get("created_at"),
+        "recorded": action.get("recorded", True),
+        "enforced": action.get("enforced", False),
+        "message": action.get("message"),
+        "related_alert": action.get("related_alert"),
     }
 
 

@@ -134,7 +134,13 @@ class MockThreatAlertRepository:
 
         return stats
 
-    async def increment_occurrence(self, alert_id: str, updated_fields: dict):
+    async def increment_occurrence(
+        self,
+        alert_id: str,
+        updated_fields: dict,
+        *,
+        identity=None,
+    ):
         alert = await self.get_by_id(alert_id)
         if not alert:
             return None
@@ -145,7 +151,8 @@ class MockThreatAlertRepository:
             "event": "DUPLICATE_OCCURRENCE",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "occurrence_number": count,
-            "threat_score": updated_fields.get("threat_score")
+            "threat_score": updated_fields.get("threat_score"),
+            "context": identity or {},
         })
 
         alert.update(updated_fields)
@@ -154,10 +161,38 @@ class MockThreatAlertRepository:
         alert["updated_at"] = datetime.now(timezone.utc).isoformat()
         return alert
 
-    async def find_active_alert_by_ip(self, ip: str, timeframe_seconds: int):
+    async def find_active_alert(
+        self,
+        *,
+        source_ip,
+        threat_type,
+        flow_id,
+        session_id,
+        timeframe_seconds,
+    ):
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=timeframe_seconds)
         for a in self.alerts:
-            if a.get("source_ip") == ip and a.get("status") in ["OPEN", "INVESTIGATING"]:
+            contexts = [
+                event.get("context") or {}
+                for event in a.get("timeline") or []
+                if isinstance(event, dict)
+            ]
+            identity_matches = (
+                any(context.get("flow_id") == flow_id for context in contexts)
+                if flow_id
+                else any(
+                    context.get("session_id") == session_id
+                    for context in contexts
+                )
+                if session_id
+                else str(a.get("model1_classification") or "").lower()
+                == threat_type
+            )
+            if (
+                a.get("source_ip") == source_ip
+                and a.get("status") in ["OPEN", "INVESTIGATING"]
+                and identity_matches
+            ):
                 dt = datetime.fromisoformat(a.get("updated_at"))
                 if dt >= cutoff:
                     return a
@@ -199,6 +234,38 @@ class TestThreatAlerts:
         }
         res = await generator.generate_alert(low_threat)
         assert res is None
+
+        incomplete_high = {
+            "source_ip": "1.1.1.2",
+            "severity": "HIGH",
+            "action": "INVESTIGATE",
+            "analysis_status": "partial",
+            "local_models_available": False,
+            "threat_score": 80.0,
+            "explanation": ["Local evidence is incomplete"],
+        }
+        assert await generator.generate_alert(incomplete_high) is None
+
+    @pytest.mark.asyncio
+    async def test_suspicious_high_result_creates_open_warning(self):
+        mock_alert_repo.alerts = []
+        generator = AlertGenerator(AlertService(mock_alert_repo))
+        alert = await generator.generate_alert(
+            {
+                "source_ip": "203.0.113.10",
+                "severity": "HIGH",
+                "action": "INVESTIGATE",
+                "analysis_status": "complete",
+                "threat_score": 78.0,
+                "explanation": ["Suspicious high-confidence flow"],
+                "model1_classification": "Suspicious",
+                "flow_id": "flow-warning",
+                "session_id": "session-warning",
+            }
+        )
+        assert alert is not None
+        assert alert["status"] == "OPEN"
+        assert alert["severity"] == "HIGH"
 
     @pytest.mark.asyncio
     async def test_alert_creation_and_duplication(self):
@@ -244,6 +311,27 @@ class TestThreatAlerts:
         assert len(alert2["timeline"]) == 2
         assert alert2["timeline"][1]["event"] == "DUPLICATE_OCCURRENCE"
         assert len(mock_alert_repo.alerts) == 1  # Deduplicated!
+
+    @pytest.mark.asyncio
+    async def test_different_flows_from_same_ip_are_not_merged(self):
+        previous_alerts = list(mock_alert_repo.alerts)
+        mock_alert_repo.alerts = []
+        generator = AlertGenerator(AlertService(mock_alert_repo))
+        base = {
+            "source_ip": "198.51.100.20",
+            "severity": "HIGH",
+            "action": "ALERT",
+            "analysis_status": "complete",
+            "threat_score": 82.0,
+            "explanation": ["Suspicious flow"],
+            "model1_classification": "Suspicious",
+            "session_id": "session-1",
+        }
+        first = await generator.generate_alert({**base, "flow_id": "flow-1"})
+        second = await generator.generate_alert({**base, "flow_id": "flow-2"})
+        assert first["alert_id"] != second["alert_id"]
+        assert len(mock_alert_repo.alerts) == 2
+        mock_alert_repo.alerts = previous_alerts
 
     def test_list_threats_endpoints(self, client):
         # Test GET /threats

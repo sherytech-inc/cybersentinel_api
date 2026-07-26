@@ -25,6 +25,10 @@ class FirewallActionResponse(BaseModel):
     reason: Optional[str] = None
     source: str = "USER"  # USER | CHATBOT | AUTO
     created_at: datetime
+    recorded: bool = True
+    enforced: bool = False
+    status: str = "RECORDED_ONLY"
+    message: str = "Action recorded; no OS firewall enforcement was performed."
 
 
 class FirewallActionListResponse(BaseModel):

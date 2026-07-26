@@ -5,6 +5,7 @@ Orchestrates Phase 8 SOC response actions (block, unblock, investigate, resolve)
 """
 
 import logging
+import sys
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -37,10 +38,15 @@ class ResponseService:
         alert_stats = await self.threat_alert_repo.get_stats(include_demo=include_demo)
         active_threats = alert_stats.get("open_alerts", 0) + alert_stats.get("investigating_alerts", 0)
         
-        blocked_ips = await self.firewall_action_repo.get_blocked_ips(include_demo=include_demo)
-        
-        # Simple count of all actions
-        total_actions = await self.firewall_action_repo.count(include_demo=include_demo)
+        blocked_ips = await self._get_enforced_blocked_ips()
+
+        count_result = await (
+            self.firewall_action_repo._db.table("audit_logs")
+            .select("id", count="exact")
+            .eq("resource", "RESPONSE")
+            .execute()
+        )
+        total_actions = count_result.count or 0
 
         return {
             "active_threats": active_threats,
@@ -83,94 +89,143 @@ class ResponseService:
                 rows = sorted(rows, key=lambda x: x.get("created_at", ""), reverse=True)
                 total += len(demo_rows)
                 rows = rows[offset:offset + page_size]
-                
-            return rows, total
+
+            normalized = [
+                {
+                    **row,
+                    **AlertService.extract_identity(row),
+                }
+                for row in rows
+            ]
+            return normalized, total
         except Exception as exc:
             logger.exception("Failed to get threat queue: %s", exc)
             return [], 0
 
-    async def block_ip(self, ip: str, user_id: uuid.UUID, reason: Optional[str] = None) -> Optional[dict]:
-        """Block an IP, log it, and broadcast."""
-        # Idempotency check: see if there's already a BLOCK action for this IP
-        existing = await self.firewall_action_repo._db.table(self.firewall_action_repo._table)\
-            .select("*").eq("ip", ip).eq("action", "BLOCK").execute()
-        if existing and existing.data:
+    async def block_ip(
+        self,
+        ip: str,
+        user_id: uuid.UUID,
+        reason: Optional[str] = None,
+        alert_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Record a block request. No OS firewall enforcement exists."""
+        return await self._record_firewall_action(
+            "BLOCK", ip, user_id, reason, alert_id
+        )
+
+    async def unblock_ip(
+        self,
+        ip: str,
+        user_id: uuid.UUID,
+        reason: Optional[str] = None,
+        alert_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Record an unblock request. No OS firewall enforcement exists."""
+        return await self._record_firewall_action(
+            "UNBLOCK", ip, user_id, reason, alert_id
+        )
+
+    async def whitelist_ip(
+        self,
+        ip: str,
+        user_id: uuid.UUID,
+        reason: Optional[str] = None,
+        alert_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Record a whitelist request. No OS firewall enforcement exists."""
+        return await self._record_firewall_action(
+            "WHITELIST", ip, user_id, reason, alert_id
+        )
+
+    async def _record_firewall_action(
+        self,
+        action: str,
+        ip: str,
+        user_id: uuid.UUID,
+        reason: Optional[str],
+        alert_id: Optional[str],
+    ) -> Optional[dict]:
+        recent = await self.firewall_action_repo.get_actions_for_ip(ip, limit=1)
+        if recent and str(recent[0].get("action") or "").upper() == action:
             from fastapi import HTTPException
-            raise HTTPException(status_code=409, detail="IP is already blocked")
-            
+
+            raise HTTPException(
+                status_code=409,
+                detail=f"{action.lower()}_action_already_recorded",
+            )
+
         now = datetime.now(timezone.utc).isoformat()
-        
-        # 1. Insert Firewall Action
-        action_data = {
-            "ip": ip,
-            "action": "BLOCK",
-            "reason": reason,
-            "source": "USER",
-            "created_at": now
-        }
-        action_record = await self.firewall_action_repo.insert(action_data)
-        
+        action_record = await self.firewall_action_repo.insert(
+            {
+                "ip": ip,
+                "action": action,
+                "reason": reason,
+                "source": "USER",
+                "created_at": now,
+            }
+        )
         if not action_record:
             return None
-            
-        # 2. Insert Audit Log
-        audit_data = {
-            "user_id": str(user_id) if user_id else None,
-            "action": "BLOCK",
-            "resource": "RESPONSE",
-            "resource_id": action_record.get("id"),
-            "ip_address": ip,
-            "payload": {"reason": reason},
-            "created_at": now
-        }
-        await self.firewall_action_repo._db.table("audit_logs").insert(audit_data).execute()
-        
-        # 3. Broadcast
-        await self.hub.broadcast("blocked_ip_added", {"ip": ip, "reason": reason})
-        await self.hub.broadcast("response_action_created", {"ip": ip, "action": "BLOCK"})
-        await self.hub.broadcast("analytics_updated", {})
-        
-        return action_record
 
-    async def unblock_ip(self, ip: str, user_id: uuid.UUID, reason: Optional[str] = None) -> Optional[dict]:
-        """Unblock an IP, log it, and broadcast."""
-        now = datetime.now(timezone.utc).isoformat()
-        
-        action_data = {
-            "ip": ip,
-            "action": "UNBLOCK",
+        message = (
+            f"{action.title()} request recorded. "
+            "No operating-system firewall change was made."
+        )
+        payload = {
             "reason": reason,
-            "source": "USER",
-            "created_at": now
+            "recorded": True,
+            "enforced": False,
+            "status": "RECORDED_ONLY",
+            "result": "recorded_only",
+            "message": message,
+            "platform": sys.platform,
+            "firewall_action_id": str(action_record.get("id") or ""),
         }
-        action_record = await self.firewall_action_repo.insert(action_data)
-        
-        if not action_record:
-            return None
-            
-        audit_data = {
-            "user_id": str(user_id) if user_id else None,
-            "action": "UNBLOCK",
-            "resource": "RESPONSE",
-            "resource_id": action_record.get("id"),
-            "ip_address": ip,
-            "payload": {"reason": reason},
-            "created_at": now
-        }
-        await self.firewall_action_repo._db.table("audit_logs").insert(audit_data).execute()
-        
-        await self.hub.broadcast("blocked_ip_removed", {"ip": ip, "reason": reason})
-        await self.hub.broadcast("response_action_created", {"ip": ip, "action": "UNBLOCK"})
-        await self.hub.broadcast("analytics_updated", {})
-        
-        return action_record
+        await (
+            self.firewall_action_repo._db.table("audit_logs")
+            .insert(
+                {
+                    "user_id": str(user_id) if user_id else None,
+                    "action": action,
+                    "resource": "RESPONSE",
+                    "resource_id": alert_id or str(action_record.get("id") or ""),
+                    "ip_address": ip,
+                    "payload": payload,
+                    "created_at": now,
+                }
+            )
+            .execute()
+        )
 
-    async def investigate_threat(self, alert_id: str) -> Optional[dict]:
+        event = {
+            "ip": ip,
+            "action": action,
+            "alert_id": alert_id,
+            "recorded": True,
+            "enforced": False,
+            "status": "RECORDED_ONLY",
+            "message": message,
+        }
+        await self.hub.broadcast("response_action_created", event)
+        await self.hub.broadcast("analytics_updated", {})
+        return {
+            **action_record,
+            **event,
+            "platform": sys.platform,
+        }
+
+    async def investigate_threat(
+        self,
+        alert_id: str,
+        user_id: uuid.UUID,
+    ) -> Optional[dict]:
         """Update threat status to INVESTIGATING."""
         updated = await self.alert_service.update_status(alert_id, "INVESTIGATING", "Moved to investigation")
         if updated:
             now = datetime.now(timezone.utc).isoformat()
             audit_data = {
+                "user_id": str(user_id) if user_id else None,
                 "action": "INVESTIGATE",
                 "resource": "RESPONSE",
                 "resource_id": alert_id,
@@ -179,6 +234,38 @@ class ResponseService:
             }
             await self.firewall_action_repo._db.table("audit_logs").insert(audit_data).execute()
         return updated
+
+    async def _get_enforced_blocked_ips(self) -> list[str]:
+        """Derive only confirmed OS-enforced blocks from response audit evidence."""
+        try:
+            result = await (
+                self.firewall_action_repo._db.table("audit_logs")
+                .select("ip_address,action,payload,created_at")
+                .eq("resource", "RESPONSE")
+                .order("created_at")
+                .limit(500)
+                .execute()
+            )
+            blocked: set[str] = set()
+            for row in result.data or []:
+                payload = row.get("payload")
+                if not isinstance(payload, dict) or payload.get("enforced") is not True:
+                    continue
+                ip = row.get("ip_address")
+                action = str(row.get("action") or "").upper()
+                if not ip:
+                    continue
+                if action == "BLOCK":
+                    blocked.add(ip)
+                elif action in {"UNBLOCK", "WHITELIST"}:
+                    blocked.discard(ip)
+            return sorted(blocked)
+        except Exception as exc:
+            logger.warning(
+                "Enforced block status unavailable | type=%s",
+                type(exc).__name__,
+            )
+            return []
 
     async def resolve_threat(self, alert_id: str, user_id: uuid.UUID, notes: Optional[str] = None) -> Optional[dict]:
         """Update threat status to RESOLVED."""
@@ -235,13 +322,18 @@ class ResponseService:
                 "ip": item.get("ip_address") or "Unknown",
                 "action": item.get("action"),
                 "reason": payload.get("reason") or payload.get("notes"),
+                "source": "USER",
                 "analyst_name": analyst_name,
-                "status": "SUCCESS",
+                "status": payload.get("status") or "RECORDED",
                 "created_at": item.get("created_at"),
-                "recorded": True,
-                "enforced": False,
+                "recorded": payload.get("recorded", True),
+                "enforced": payload.get("enforced", False),
                 "note": payload.get("notes"),
-                "message": "Action recorded but not enforced at OS level."
+                "related_alert": item.get("resource_id"),
+                "message": (
+                    payload.get("message")
+                    or "Action recorded; enforcement evidence is unavailable."
+                ),
             })
         return mapped_items, total
 

@@ -258,6 +258,48 @@ async def test_internal_flow_skips_model3_provider_invocation(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_persistence_failure_does_not_suppress_live_terminal_result(
+    monkeypatch,
+):
+    hub = _EventHub()
+    intel = _DeterministicIntel(available=False)
+    monkeypatch.setattr(
+        "app.services.websocket.connection_manager.get_websocket_hub",
+        lambda: hub,
+    )
+    monkeypatch.setattr(
+        "app.services.intelligence.get_enrichment_service",
+        lambda: intel,
+    )
+    manager = FlowManager(FeatureExtractor())
+
+    async def fail_persistence(**_kwargs):
+        raise RuntimeError("storage unavailable")
+
+    monkeypatch.setattr(manager, "_persist_flow_analysis", fail_persistence)
+    manager.set_session_context("ephemeral-test-session")
+    manager._accepting_analysis = True
+    worker = asyncio.create_task(manager._analysis_worker(0))
+    manager._analysis_workers = [worker]
+
+    _add_eligible_flow(manager)
+    flow = next(iter(manager._active_flows.values()))
+    manager._queue_flow_analysis(flow)
+    await asyncio.wait_for(manager._analysis_queue.join(), timeout=10)
+
+    worker.cancel()
+    await asyncio.gather(worker, return_exceptions=True)
+    update = next(
+        payload
+        for event_type, payload in hub.events
+        if event_type == "packet_analysis_update"
+    )
+    assert update["analysis_status"] == "partial"
+    assert manager.stats["analysis_completed"] == 1
+    assert manager.stats["analysis_failed"] == 0
+
+
+@pytest.mark.asyncio
 async def test_duplicate_terminal_update_does_not_double_count(monkeypatch):
     hub = _EventHub()
     monkeypatch.setattr(

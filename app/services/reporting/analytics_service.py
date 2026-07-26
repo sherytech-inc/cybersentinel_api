@@ -373,10 +373,13 @@ class AnalyticsService:
                         "timestamp": item.get("created_at"),
                         "target": item.get("ip"),
                         "action": item.get("action") or "UNKNOWN",
-                        "status": "RECORDED",
+                        "status": "RECORDED_ONLY",
                         "analyst": item.get("source"),
                         "related_alert": None,
-                        "result": item.get("reason"),
+                        "result": (
+                            item.get("reason")
+                            or "Recorded only; no OS enforcement evidence."
+                        ),
                         "platform": None,
                     }
                 )
@@ -408,7 +411,7 @@ class AnalyticsService:
                         "timestamp": item.get("created_at"),
                         "target": item.get("ip_address"),
                         "action": action,
-                        "status": "RECORDED",
+                        "status": payload.get("status") or "RECORDED",
                         "analyst": (
                             str(item.get("user_id"))
                             if item.get("user_id")
