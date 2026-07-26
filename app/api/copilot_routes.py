@@ -44,7 +44,7 @@ from app.services.chatbot.llm_service import (
     LLMTimeoutError,
     LLMUnavailableError,
 )
-from app.services.chatbot.router import ChatRouter
+from app.services.chatbot.router import ChatRouter, ContextUnavailableError
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/copilot", tags=["Copilot"])
@@ -54,6 +54,8 @@ _session_locks: dict[str, asyncio.Lock] = {}
 NOT_CONFIGURED = "AI Analyst is unavailable because the language-model service is not configured."
 TEMPORARILY_UNAVAILABLE = "AI Analyst is temporarily unavailable. Packet capture and threat monitoring are still running."
 TEMPORARILY_BUSY = "AI Analyst is temporarily busy. Please try again shortly."
+RATE_LIMITED = "AI Analyst is temporarily rate limited. Try again shortly."
+CONTEXT_UNAVAILABLE = "Live security context is temporarily unavailable."
 
 
 def _rate_limited(key: str) -> bool:
@@ -93,7 +95,7 @@ async def post_copilot_chat(
     key = f"{analyst.user_id}:{body.session_id}"
     if _rate_limited(key):
         return CopilotChatResponse(
-            session_id=body.session_id, intent="RATE_LIMITED", response=TEMPORARILY_BUSY,
+            session_id=body.session_id, intent="RATE_LIMITED", response=RATE_LIMITED,
             context_used=context_used, timestamp=datetime.now(timezone.utc), available=False,
         )
 
@@ -119,12 +121,18 @@ async def post_copilot_chat(
             timestamp=datetime.now(timezone.utc),
             available=True,
         )
-    except LLMConfigurationError:
-        message = NOT_CONFIGURED
+    except LLMConfigurationError as exc:
+        message = (
+            NOT_CONFIGURED
+            if str(exc) == "groq_not_configured"
+            else TEMPORARILY_UNAVAILABLE
+        )
     except LLMRateLimitError:
-        message = TEMPORARILY_BUSY
+        message = RATE_LIMITED
     except (LLMTimeoutError, LLMUnavailableError):
         message = TEMPORARILY_UNAVAILABLE
+    except ContextUnavailableError:
+        message = CONTEXT_UNAVAILABLE
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -223,4 +231,3 @@ async def get_copilot_context(
         top_attack_types=top_attack_types,
         system_health=system_health,
     )
-

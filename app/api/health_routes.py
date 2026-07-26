@@ -51,13 +51,13 @@ async def readiness_check(response: Response, settings: Settings = Depends(get_s
         }
     }
 
-    # 3. Chatbot (Groq) Check
-    groq_configured = True  # Handled by Edge Functions now
+    # 3. Chatbot (Groq) Check — optional for capture and monitoring readiness.
+    groq_configured = bool(settings.GROQ_API_KEY)
     chatbot_status = {
         "required": False,
-        "architecture": "edge_function_groq",
+        "architecture": "local_fastapi_groq",
         "configured": groq_configured,
-        "status": "available"
+        "status": "available" if groq_configured else "not_configured",
     }
 
     # 4. Overall Status Logic

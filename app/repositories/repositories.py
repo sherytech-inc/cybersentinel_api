@@ -279,19 +279,24 @@ class CopilotConversationRepository(BaseRepository):
         super().__init__(client, "copilot_conversations")
 
     async def get_session_history(self, session_id: str, limit: int = 20) -> list[dict]:
-        """Retrieve the last N messages in a copilot session."""
+        """Retrieve the latest N messages in chronological order."""
         try:
             result = (
                 await self._db.table("copilot_conversations")
                 .select("*")
                 .eq("session_id", session_id)
-                .order("created_at", desc=False)
+                .order("created_at", desc=True)
                 .limit(limit)
                 .execute()
             )
-            return result.data or []
+            rows = result.data or []
+            rows.reverse()
+            return rows
         except Exception as exc:
-            logger.exception("get_session_history failed: %s", exc)
+            logger.warning(
+                "Copilot history unavailable | type=%s",
+                type(exc).__name__,
+            )
             return []
 
 

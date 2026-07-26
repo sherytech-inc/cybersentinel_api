@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 import asyncio
 import logging
+from collections import deque
 from typing import Set, List, Optional
 from fastapi import WebSocket
 
@@ -23,6 +24,7 @@ class WebSocketHub:
         self._queue_lock = asyncio.Lock()
         self._PACKET_QUEUE_MAX = 500   # visible limit across all connected clients
         self._BATCH_SIZE = 50          # packets per WebSocket push
+        self._analysis_context: deque[dict] = deque(maxlen=20)
 
     async def connect(self, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -39,6 +41,8 @@ class WebSocketHub:
 
     async def broadcast(self, event_type: str, payload: dict, event_version: str = "1.0") -> None:
         """Broadcast a message using the envelope schema to all active connections."""
+        if event_type == "packet_analysis_update":
+            self._remember_analysis_context(payload)
         if not self.active_connections:
             return
             
@@ -67,6 +71,103 @@ class WebSocketHub:
                 
         for connection in disconnected:
             await self.disconnect(connection)
+
+    def _remember_analysis_context(self, payload: dict) -> None:
+        """Retain bounded sanitized evidence already published to live clients."""
+        flow_id = payload.get("flow_id")
+        if not flow_id:
+            return
+        analysis_status = str(payload.get("analysis_status") or "").lower()
+        if analysis_status not in {"complete", "partial", "failed"}:
+            return
+        session_id = None
+        flow_context: dict = {}
+        try:
+            from app.services.packet_capture.capture_service import (
+                get_capture_service,
+            )
+
+            capture_service = get_capture_service()
+            session_id = capture_service.get_status().get("session_id")
+            candidate_flows = [
+                *capture_service.flow_manager.get_active_flows(),
+                *capture_service.flow_manager.get_recent_completed(20),
+            ]
+            matching_flow = next(
+                (
+                    flow
+                    for flow in candidate_flows
+                    if str(getattr(flow, "flow_id", "")) == str(flow_id)
+                ),
+                None,
+            )
+            if matching_flow is not None:
+                flow_context = matching_flow.model_dump()
+        except Exception:
+            pass
+
+        model_results = payload.get("model_results")
+        if not isinstance(model_results, dict):
+            model_results = {}
+        model1 = model_results.get("model1")
+        model2 = model_results.get("model2")
+        model3 = model_results.get("model3")
+        record = {
+            "session_id": session_id,
+            "flow_id": flow_id,
+            "packet_ids": list(payload.get("packet_ids") or [])[:8],
+            "analysis_status": analysis_status,
+            "severity": payload.get("severity"),
+            "ml_prediction": payload.get("ml_prediction"),
+            "ml_confidence": payload.get("ml_confidence"),
+            "anomaly_score": payload.get("anomaly_score"),
+            "threat_score": payload.get("threat_score"),
+            "action": payload.get("action"),
+            "model3_available": payload.get("model3_available"),
+            "model3_intelligence_score": payload.get(
+                "model3_intelligence_score"
+            ),
+            "model1": model1 if isinstance(model1, dict) else None,
+            "model2": model2 if isinstance(model2, dict) else None,
+            "model3": model3 if isinstance(model3, dict) else None,
+            "src_ip": flow_context.get("src_ip"),
+            "dst_ip": flow_context.get("dst_ip"),
+            "src_port": flow_context.get("src_port"),
+            "dst_port": flow_context.get("dst_port"),
+            "protocol": flow_context.get("protocol"),
+            "total_packets": flow_context.get("total_packets"),
+            "ended_at": (
+                flow_context.get("ended_at")
+                or flow_context.get("last_activity")
+            ),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        retained = [
+            item
+            for item in self._analysis_context
+            if not (
+                item.get("flow_id") == flow_id
+                and item.get("session_id") == session_id
+            )
+        ]
+        self._analysis_context.clear()
+        self._analysis_context.extend(retained)
+        self._analysis_context.append(record)
+
+    def get_recent_analysis_context(
+        self,
+        limit: int = 10,
+        session_id: Optional[str] = None,
+    ) -> list[dict]:
+        """Return newest bounded live-analysis evidence for Copilot context."""
+        records = list(reversed(self._analysis_context))
+        if session_id:
+            records = [
+                item
+                for item in records
+                if item.get("session_id") == session_id
+            ]
+        return records[: max(min(limit, 20), 0)]
 
     async def queue_packet(self, packet_data: dict) -> None:
         """Add a captured packet to the batching queue (bounded to 500)."""
