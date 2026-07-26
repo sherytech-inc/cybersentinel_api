@@ -21,6 +21,7 @@ class BaseHTTPClient:
     _base_url: str = ""
     _default_headers: dict = {}
     _timeout: float = 10.0
+    _max_retry_wait: float = 5.0
 
     def __init__(self):
         self._client: Optional[httpx.AsyncClient] = None
@@ -48,7 +49,7 @@ class BaseHTTPClient:
             try:
                 r = await self._client.get(url, params=params, headers=headers)
                 if r.status_code == 429:
-                    wait = int(r.headers.get("Retry-After", self._backoff * attempt))
+                    wait = self._retry_wait(r, attempt)
                     logger.warning("[%s] Rate-limited. Waiting %ds", provider_name, wait)
                     await asyncio.sleep(wait); continue
                 if r.status_code in self._retry_statuses:
@@ -82,7 +83,7 @@ class BaseHTTPClient:
             try:
                 r = await self._client.post(url, data=data, json=json_data, headers=headers)
                 if r.status_code == 429:
-                    wait = int(r.headers.get("Retry-After", self._backoff * attempt))
+                    wait = self._retry_wait(r, attempt)
                     logger.warning("[%s] Rate-limited POST. Waiting %ds", provider_name, wait)
                     await asyncio.sleep(wait); continue
                 if r.status_code in self._retry_statuses:
@@ -96,3 +97,11 @@ class BaseHTTPClient:
                 return None
         logger.error("[%s] All %d POST attempts exhausted", provider_name, self._max_retries)
         return None
+
+    def _retry_wait(self, response: httpx.Response, attempt: int) -> float:
+        raw = response.headers.get("Retry-After")
+        try:
+            requested = float(raw) if raw is not None else self._backoff * attempt
+        except (TypeError, ValueError):
+            requested = self._backoff * attempt
+        return max(0.0, min(requested, self._max_retry_wait))

@@ -17,7 +17,8 @@ from pydantic import BaseModel, Field
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ScanStatus(str, Enum):
-    completed = "completed"
+    complete = "complete"
+    completed = "complete"
     pending = "pending"
     not_found = "not_found"
     not_configured = "not_configured"

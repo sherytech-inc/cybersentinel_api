@@ -445,12 +445,20 @@ class TestIntelligenceRoutes:
         assert data["status"] == "ok"
         assert "cache_size" in data
 
-    def test_lookup_rejects_private_ip(self, client):
+    def test_lookup_skips_private_ip_providers(self, client):
         resp = client.post(
             "/api/v1/intelligence/lookup",
             json={"ip": "192.168.1.1"},
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["analysis_status"] == "failed"
+        assert data["providers_queried"] == []
+        assert data["providers_available"] == []
+        assert data["virustotal"]["status"] == "skipped"
+        assert data["abuseipdb"]["status"] == "skipped"
+        assert data["geoip"]["status"] == "skipped"
+        assert "skipped" in data["message"].lower()
 
     def test_lookup_rejects_invalid_ip(self, client):
         resp = client.post(

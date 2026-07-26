@@ -42,6 +42,7 @@ class GeoIPClient(BaseHTTPClient):
                 status=IntelProviderStatus.completed,
                 country=raw.get("country", "Unknown"),
                 country_code=raw.get("countryCode", "XX"),
+                region=raw.get("regionName"),
                 city=raw.get("city"),
                 asn=asn,
                 organization=raw.get("org", "Unknown"),
@@ -49,14 +50,25 @@ class GeoIPClient(BaseHTTPClient):
                 is_proxy=bool(raw.get("proxy", False)),
                 is_hosting=bool(raw.get("hosting", False)),
             )
-        except ProviderNotFoundError as e:
-            return GeoIpIntelResult(status=IntelProviderStatus.not_found, message=str(e))
-        except ProviderQuotaExceededError as e:
-            return GeoIpIntelResult(status=IntelProviderStatus.quota_exceeded, message=str(e))
-        except ProviderUnavailableError as e:
-            return GeoIpIntelResult(status=IntelProviderStatus.unavailable, message=str(e))
-        except ProviderError as e:
-            return GeoIpIntelResult(status=IntelProviderStatus.unavailable, message=str(e))
-        except Exception as e:
-            logger.exception("GeoIP parse error for %s: %s", ip, e)
-            return GeoIpIntelResult(status=IntelProviderStatus.unavailable, message=f"Parse error: {e}")
+        except ProviderNotFoundError:
+            return GeoIpIntelResult(
+                status=IntelProviderStatus.not_found,
+                message="No GeoIP record was found.",
+            )
+        except ProviderQuotaExceededError:
+            return GeoIpIntelResult(
+                status=IntelProviderStatus.quota_exceeded,
+                message="GeoIP is rate limited.",
+            )
+        except (ProviderUnavailableError, ProviderError) as exc:
+            logger.warning("GeoIP lookup unavailable | type=%s", type(exc).__name__)
+            return GeoIpIntelResult(
+                status=IntelProviderStatus.unavailable,
+                message="GeoIP is temporarily unavailable.",
+            )
+        except Exception as exc:
+            logger.warning("GeoIP response invalid | type=%s", type(exc).__name__)
+            return GeoIpIntelResult(
+                status=IntelProviderStatus.unavailable,
+                message="GeoIP returned an invalid response.",
+            )

@@ -46,6 +46,11 @@ class AbuseIPDBClient(BaseHTTPClient):
                 abuse_confidence_score=int(data.get("abuseConfidenceScore") or 0),
                 total_reports=int(data.get("totalReports") or 0),
                 num_distinct_users=int(data.get("numDistinctUsers") or 0),
+                last_reported_at=(
+                    str(data.get("lastReportedAt"))
+                    if data.get("lastReportedAt")
+                    else None
+                ),
                 is_whitelisted=data.get("isWhitelisted"),
                 is_tor=data.get("isTor"),
             )

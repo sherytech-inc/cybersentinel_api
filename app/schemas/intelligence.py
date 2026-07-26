@@ -6,7 +6,7 @@ import re
 from datetime import datetime
 from enum import Enum
 from typing import Optional
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, model_validator
 
 class IntelSeverity(str, Enum):
     SAFE = "Safe"
@@ -26,6 +26,7 @@ class IntelStatus(str, Enum):
 
 class IntelProviderStatus(str, Enum):
     completed = "completed"
+    skipped = "skipped"
     not_configured = "not_configured"
     not_found = "not_found"
     quota_exceeded = "quota_exceeded"
@@ -69,12 +70,14 @@ class AbuseIpDbIntelResult(ProviderState):
     abuse_confidence_score: Optional[int] = None
     total_reports: Optional[int] = None
     num_distinct_users: Optional[int] = None
+    last_reported_at: Optional[str] = None
     is_whitelisted: Optional[bool] = None
     is_tor: Optional[bool] = None
 
 class GeoIpIntelResult(ProviderState):
     country: Optional[str] = None
     country_code: Optional[str] = None
+    region: Optional[str] = None
     city: Optional[str] = None
     asn: Optional[str] = None
     organization: Optional[str] = None
@@ -84,6 +87,7 @@ class GeoIpIntelResult(ProviderState):
 
 class IntelligenceResponse(BaseModel):
     ip: str
+    target: Optional[str] = None
     status: IntelStatus
 
     intel_score: Optional[int] = None
@@ -104,6 +108,12 @@ class IntelligenceResponse(BaseModel):
     cached: bool = False
 
     model_config = {"use_enum_values": True}
+
+    @model_validator(mode="after")
+    def populate_target(self):
+        if self.target is None:
+            self.target = self.ip
+        return self
 
 class BulkIntelligenceResponse(BaseModel):
     results: dict[str, IntelligenceResponse] = Field(default_factory=dict)

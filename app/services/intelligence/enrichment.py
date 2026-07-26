@@ -63,7 +63,8 @@ class IntelligenceEnrichmentService:
             intel_severity = None
             score_confidence = None
         elif status == IntelStatus.partial:
-            intel_score, intel_severity = self._scorer.compute(abuse, vt, geo)
+            intel_score = None
+            intel_severity = None
             score_confidence = "LIMITED"
         else: # completed
             intel_score, intel_severity = self._scorer.compute(abuse, vt, geo)
@@ -77,7 +78,7 @@ class IntelligenceEnrichmentService:
         if status == IntelStatus.not_configured:
             msg = "Security providers are not configured."
         elif status == IntelStatus.partial:
-            msg = "Results are partial due to provider failure or rate limit."
+            msg = "Partial intelligence is available."
         elif status == IntelStatus.completed:
             msg = "All providers successfully queried."
         else:

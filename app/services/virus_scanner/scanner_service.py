@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import mimetypes
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -91,7 +92,14 @@ class VirusScannerService:
             async with self._client() as client:
                 response = await client.post(
                     "/files",
-                    files={"file": (safe_name, content, "application/octet-stream")},
+                    files={
+                        "file": (
+                            safe_name,
+                            content,
+                            mimetypes.guess_type(safe_name)[0]
+                            or "application/octet-stream",
+                        )
+                    },
                 )
                 error = self._http_error(response, safe_name, "file")
                 if error: return error
@@ -121,7 +129,14 @@ class VirusScannerService:
             if attributes.get("status") == "completed":
                 return self._completed(target, scan_type, attributes.get("stats") or {}, analysis_id)
             await asyncio.sleep(settings.VIRUS_SCANNER_POLL_INTERVAL_SECONDS)
-        return self._result(target, scan_type, ScanStatus.pending, "Analysis is pending.", analysis_id=analysis_id, contacted=True)
+        return self._result(
+            target,
+            scan_type,
+            ScanStatus.pending,
+            "Analysis is still pending.",
+            analysis_id=analysis_id,
+            contacted=True,
+        )
 
     def _http_error(self, response, target: str, scan_type: str) -> VirusScanResponse | None:
         if response.status_code < 400: return None
@@ -133,19 +148,46 @@ class VirusScannerService:
             )
             return self._result(target, scan_type, ScanStatus.not_found, message, contacted=True)
         if response.status_code == 429:
-            return self._result(target, scan_type, ScanStatus.quota_exceeded, "VirusTotal is rate limited. Please try again shortly.", contacted=True)
+            return self._result(
+                target,
+                scan_type,
+                ScanStatus.quota_exceeded,
+                "Provider rate limited.",
+                contacted=True,
+            )
         if response.status_code in {401, 403}:
             return self._result(target, scan_type, ScanStatus.not_configured, "VirusTotal integration is not configured correctly.", contacted=True)
         return self._unavailable(target, scan_type, contacted=True)
 
     def _completed(self, target: str, scan_type: str, stats: dict, analysis_id: str | None = None) -> VirusScanResponse:
-        malicious = int(stats.get("malicious") or 0)
-        suspicious = int(stats.get("suspicious") or 0)
+        try:
+            malicious = int(stats.get("malicious") or 0)
+            suspicious = int(stats.get("suspicious") or 0)
+            harmless = int(stats.get("harmless") or 0)
+            undetected = int(stats.get("undetected") or 0)
+        except (AttributeError, TypeError, ValueError):
+            return self._result(
+                target,
+                scan_type,
+                ScanStatus.failed,
+                "Provider returned an invalid analysis response.",
+                analysis_id=analysis_id,
+                contacted=True,
+            )
+        if malicious + suspicious + harmless + undetected == 0:
+            return self._result(
+                target,
+                scan_type,
+                ScanStatus.failed,
+                "Provider returned no usable detection statistics.",
+                analysis_id=analysis_id,
+                contacted=True,
+            )
         verdict = "malicious" if malicious else "suspicious" if suspicious else "clean"
         return VirusScanResponse(
-            target=target, scan_type=scan_type, status=ScanStatus.completed,
+            target=target, scan_type=scan_type, status=ScanStatus.complete,
             verdict=verdict, malicious=malicious, suspicious=suspicious,
-            harmless=int(stats.get("harmless") or 0), undetected=int(stats.get("undetected") or 0),
+            harmless=harmless, undetected=undetected,
             analysis_id=analysis_id, message="Scan completed.", provider_contacted=True,
             scanned_at=datetime.now(timezone.utc),
         )
@@ -158,7 +200,18 @@ class VirusScannerService:
         )
 
     def _not_configured(self, target, scan_type):
-        return self._result(target, scan_type, ScanStatus.not_configured, "VirusTotal integration is not configured.")
+        return self._result(
+            target,
+            scan_type,
+            ScanStatus.not_configured,
+            "Integration not configured.",
+        )
 
     def _unavailable(self, target, scan_type, contacted=False):
-        return self._result(target, scan_type, ScanStatus.unavailable, "VirusTotal is temporarily unavailable.", contacted=contacted)
+        return self._result(
+            target,
+            scan_type,
+            ScanStatus.unavailable,
+            "Provider temporarily unavailable.",
+            contacted=contacted,
+        )

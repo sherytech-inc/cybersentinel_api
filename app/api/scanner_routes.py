@@ -39,16 +39,22 @@ async def scan_file(
     limit = get_settings().VIRUS_SCANNER_MAX_FILE_BYTES
     chunks = []
     size = 0
-    while chunk := await file.read(64 * 1024):
-        size += len(chunk)
-        if size > limit:
-            return VirusScanResponse(
-                target=Path(file.filename or "selected-file").name,
-                scan_type="file",
-                status=ScanStatus.file_too_large,
-                verdict="unknown",
-                message="File size exceeds the 10 MB limit.",
-            )
-        chunks.append(chunk)
-    content = b"".join(chunks)
-    return await VirusScannerService().scan_file(Path(file.filename or "selected-file").name, content)
+    try:
+        while chunk := await file.read(64 * 1024):
+            size += len(chunk)
+            if size > limit:
+                return VirusScanResponse(
+                    target=Path(file.filename or "selected-file").name,
+                    scan_type="file",
+                    status=ScanStatus.file_too_large,
+                    verdict="unknown",
+                    message="File size exceeds the 10 MB limit.",
+                )
+            chunks.append(chunk)
+        content = b"".join(chunks)
+        return await VirusScannerService().scan_file(
+            Path(file.filename or "selected-file").name,
+            content,
+        )
+    finally:
+        await file.close()
