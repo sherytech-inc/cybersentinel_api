@@ -1,4 +1,5 @@
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List
 from supabase import AsyncClient
@@ -6,15 +7,19 @@ from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-class AnalyticsService:
-    def __init__(self, db: AsyncClient):
-        self._db = db
-
 TIME_RANGES = {
     "24h": timedelta(hours=24),
     "7d": timedelta(days=7),
     "30d": timedelta(days=30),
 }
+
+
+@dataclass
+class ReportRows:
+    rows: list[dict] = field(default_factory=list)
+    available: bool = True
+    message: str | None = None
+
 
 class AnalyticsService:
     def __init__(self, db: AsyncClient):
@@ -301,3 +306,161 @@ class AnalyticsService:
             return timeline[:20]
         except Exception:
             return []
+
+    async def get_report_alerts(
+        self,
+        time_range: str = "24h",
+        *,
+        limit: int = 200,
+    ) -> ReportRows:
+        """Return recent alert evidence without turning failures into zero data."""
+        cutoff = self._get_time_cutoff(time_range)
+        try:
+            query = (
+                self._db.table("threat_alerts")
+                .select(
+                    "alert_id,created_at,source_ip,model1_classification,"
+                    "severity,threat_score,status,action,summary"
+                )
+                .gte("created_at", cutoff)
+                .order("created_at", desc=True)
+                .limit(limit)
+            )
+            from app.database.client import db_has_demo_columns
+
+            if db_has_demo_columns() and not get_settings().ENABLE_DEMO_MODE:
+                query = query.neq("is_demo", True)
+            result = await query.execute()
+            return ReportRows(rows=result.data or [])
+        except Exception as exc:
+            logger.warning(
+                "Report alert source unavailable | type=%s",
+                type(exc).__name__,
+            )
+            return ReportRows(
+                available=False,
+                message="Recent alert data is temporarily unavailable.",
+            )
+
+    async def get_report_actions(
+        self,
+        time_range: str = "24h",
+        *,
+        limit: int = 200,
+    ) -> ReportRows:
+        """Combine recorded firewall and response-audit actions."""
+        cutoff = self._get_time_cutoff(time_range)
+        rows: list[dict] = []
+        failures: list[str] = []
+
+        try:
+            query = (
+                self._db.table("firewall_actions")
+                .select("id,created_at,ip,action,reason,source")
+                .gte("created_at", cutoff)
+                .order("created_at", desc=True)
+                .limit(limit)
+            )
+            from app.database.client import db_has_demo_columns
+
+            if db_has_demo_columns() and not get_settings().ENABLE_DEMO_MODE:
+                query = query.neq("is_demo", True)
+            result = await query.execute()
+            for item in result.data or []:
+                rows.append(
+                    {
+                        "action_id": str(item.get("id") or ""),
+                        "timestamp": item.get("created_at"),
+                        "target": item.get("ip"),
+                        "action": item.get("action") or "UNKNOWN",
+                        "status": "RECORDED",
+                        "analyst": item.get("source"),
+                        "related_alert": None,
+                        "result": item.get("reason"),
+                        "platform": None,
+                    }
+                )
+        except Exception as exc:
+            failures.append("firewall")
+            logger.warning(
+                "Report firewall action source unavailable | type=%s",
+                type(exc).__name__,
+            )
+
+        try:
+            result = await (
+                self._db.table("audit_logs")
+                .select("id,created_at,ip_address,action,resource_id,payload,user_id")
+                .eq("resource", "RESPONSE")
+                .gte("created_at", cutoff)
+                .order("created_at", desc=True)
+                .limit(limit)
+                .execute()
+            )
+            for item in result.data or []:
+                payload = item.get("payload")
+                if not isinstance(payload, dict):
+                    payload = {}
+                action = str(item.get("action") or "UNKNOWN").upper()
+                rows.append(
+                    {
+                        "action_id": str(item.get("id") or ""),
+                        "timestamp": item.get("created_at"),
+                        "target": item.get("ip_address"),
+                        "action": action,
+                        "status": "RECORDED",
+                        "analyst": (
+                            str(item.get("user_id"))
+                            if item.get("user_id")
+                            else None
+                        ),
+                        "related_alert": item.get("resource_id"),
+                        "result": (
+                            payload.get("result")
+                            or payload.get("message")
+                            or payload.get("reason")
+                            or payload.get("notes")
+                        ),
+                        "platform": payload.get("platform"),
+                    }
+                )
+        except Exception as exc:
+            failures.append("audit")
+            logger.warning(
+                "Report response audit source unavailable | type=%s",
+                type(exc).__name__,
+            )
+
+        rows.sort(key=lambda item: str(item.get("timestamp") or ""), reverse=True)
+        if failures:
+            return ReportRows(
+                rows=rows[:limit],
+                available=False,
+                message="Some response action data is temporarily unavailable.",
+            )
+        return ReportRows(rows=rows[:limit])
+
+    async def enrich_attacker_countries(
+        self,
+        source_ips: list[str],
+    ) -> ReportRows:
+        """Return available country evidence for the supplied IP addresses."""
+        if not source_ips:
+            return ReportRows()
+        try:
+            result = await (
+                self._db.table("ip_intelligence")
+                .select("ip_address,country")
+                .in_("ip_address", source_ips)
+                .execute()
+            )
+            return ReportRows(rows=result.data or [])
+        except Exception as exc:
+            logger.warning(
+                "Report intelligence source unavailable | type=%s",
+                type(exc).__name__,
+            )
+            return ReportRows(
+                available=False,
+                message="IP intelligence enrichment is temporarily unavailable.",
+            )

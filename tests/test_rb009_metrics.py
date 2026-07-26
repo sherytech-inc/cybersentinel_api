@@ -4,8 +4,8 @@ RB-009 Metrics Consistency — Comprehensive Verification
 
 Tests that:
 1. AnalyticsService aggregation is correct across 24h, 7d, 30d ranges.
-2. Dashboard /api/v1/dashboard/stats returns the same values as
-   Reports /api/v1/reporting/dashboard for the same time range.
+2. The normalized /api/v1/reporting/summary returns the same recent alert
+   evidence used by the 24-hour analytics source.
 3. 24h != 7d when records exist outside the 24-hour window.
 4. Blocked-IP reconstruction is deterministic under edge cases:
    - BLOCK → BLOCK → UNBLOCK → BLOCK = blocked
@@ -102,7 +102,7 @@ async def _seed_core_data(db, now):
 # ═══════════════════════════════════════════════════════════════════
 @pytest.mark.asyncio
 async def test_rb009_cross_endpoint_consistency():
-    """Dashboard period.* must equal Reports 24h KPIs, and 24h != 7d."""
+    """Dashboard and normalized Reports retain consistent 24-hour evidence."""
     await init_db()
     db = await get_db_client()
     now = _utc_now()
@@ -164,35 +164,17 @@ async def test_rb009_cross_endpoint_consistency():
         assert dash["period"]["response_actions"] == kpis_24h["response_actions"]
         assert dash["period"]["recorded_blocks"] == kpis_24h["recorded_blocks"]
 
-    # ── Reports endpoint verification ─────────────────────────────
+    # ── Normalized Reports endpoint verification ──────────────────
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        # 24h
-        rep_24h_resp = await client.get("/api/v1/reporting/dashboard?time_range=24h")
-        assert rep_24h_resp.status_code == 200
-        rep_24h = rep_24h_resp.json()
-        rep_kpis_24h = rep_24h["kpis"]
-
-        # Dashboard period == Reports 24h
-        assert dash["period"]["total_threats"] == rep_kpis_24h["total_threats"], \
-            "Dashboard period.total_threats must equal Reports 24h total_threats"
-        assert dash["period"]["response_actions"] == rep_kpis_24h["response_actions"], \
-            "Dashboard period.response_actions must equal Reports 24h response_actions"
-        assert dash["period"]["recorded_blocks"] == rep_kpis_24h["recorded_blocks"], \
-            "Dashboard period.recorded_blocks must equal Reports 24h recorded_blocks"
-
-        # 7d
-        rep_7d_resp = await client.get("/api/v1/reporting/dashboard?time_range=7d")
-        assert rep_7d_resp.status_code == 200
-        rep_kpis_7d = rep_7d_resp.json()["kpis"]
-
-        # Reports 24h != Reports 7d
-        assert rep_kpis_24h["total_threats"] != rep_kpis_7d["total_threats"], \
-            "Reports 24h and 7d must return different totals when data spans boundaries"
-
-        # Reports 7d matches direct AnalyticsService
-        assert rep_kpis_7d["total_threats"] == kpis_7d["total_threats"]
-        assert rep_kpis_7d["response_actions"] == kpis_7d["response_actions"]
+        report_response = await client.get("/api/v1/reporting/summary")
+        assert report_response.status_code == 200
+        report = report_response.json()
+        assert len(report["recent_alerts"]) == kpis_24h["total_threats"]
+        assert (
+            report["severity_distribution"]["critical"]
+            == kpis_24h["critical_threats"]
+        )
 
     print("✓ Cross-endpoint consistency and time-range differentiation verified")
 

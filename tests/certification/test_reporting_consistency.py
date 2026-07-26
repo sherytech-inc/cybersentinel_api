@@ -1,51 +1,87 @@
+import os
+
 import pytest
 import requests
-import asyncio
-from app.database.client import get_db_client
 
-BASE_URL = "http://127.0.0.1:8000/api/v1"
+BASE_URL = os.getenv("CYBERSENTINEL_API_URL", "http://127.0.0.1:8000/api/v1")
+
+
+def _authenticated_headers() -> dict[str, str]:
+    access_token = os.getenv("SUPABASE_ACCESS_TOKEN")
+    local_token = os.getenv("CYBERSENTINEL_LOCAL_TOKEN")
+    if not access_token or not local_token:
+        pytest.skip("Signed-in certification credentials are not configured")
+    return {
+        "Authorization": f"Bearer {access_token}",
+        "X-CyberSentinel-Local-Token": local_token,
+    }
+
 
 def test_reporting_consistency_after_injection():
+    headers = _authenticated_headers()
+
     # 1. Inject Port Scan
-    inject_res = requests.post(f"{BASE_URL}/demo/load?scenario=port_scan", timeout=30)
+    inject_res = requests.post(
+        f"{BASE_URL}/demo/load?scenario=port_scan",
+        headers=headers,
+        timeout=30,
+    )
     assert inject_res.status_code == 200
-    
+
     # 2. Get Threat Response Count (active threats)
-    threat_res = requests.get(f"{BASE_URL}/response/overview", timeout=30)
+    threat_res = requests.get(
+        f"{BASE_URL}/response/overview",
+        headers=headers,
+        timeout=30,
+    )
     assert threat_res.status_code == 200
     threat_count = threat_res.json().get("active_threats", 0)
-    
-    # 3. Get Dashboard/Reports Count
-    dash_res = requests.get(f"{BASE_URL}/dashboard/stats", timeout=30)
-    # if the endpoint is different, e.g., /reporting/dashboard
-    if dash_res.status_code == 404:
-        dash_res = requests.get(f"{BASE_URL}/reporting/dashboard", timeout=30)
-        
-    assert dash_res.status_code == 200
-    report_threat_count = dash_res.json().get("snapshot", {}).get("active_threats", 0)
-    
-    # Ensure they match
-    assert threat_count == report_threat_count, f"Mismatch: Response={threat_count}, Reports={report_threat_count}"
-    
+
+    # 3. The normalized report exposes the same persisted active alerts.
+    summary_res = requests.get(
+        f"{BASE_URL}/reporting/summary",
+        headers=headers,
+        timeout=30,
+    )
+    assert summary_res.status_code == 200
+    summary = summary_res.json()
+    report_threat_count = sum(
+        1
+        for alert in summary["recent_alerts"]
+        if str(alert.get("status", "")).upper() in {"OPEN", "INVESTIGATING"}
+    )
+    assert threat_count == report_threat_count, (
+        f"Mismatch: Response={threat_count}, Reports={report_threat_count}"
+    )
+
     # 4. Check PDF Export
-    pdf_res = requests.get(f"{BASE_URL}/reporting/export/pdf", timeout=15)
+    pdf_res = requests.get(
+        f"{BASE_URL}/reporting/export/pdf",
+        headers=headers,
+        timeout=15,
+    )
     assert pdf_res.status_code == 200
     assert pdf_res.headers["content-type"] == "application/pdf"
-    
-    # Check CSV Export
-    csv_res = requests.get(f"{BASE_URL}/reporting/export/csv?type=alerts")
+
+    # Check canonical Alerts CSV export.
+    csv_res = requests.get(
+        f"{BASE_URL}/reporting/export/alerts.csv",
+        headers=headers,
+        timeout=15,
+    )
     assert csv_res.status_code == 200
     assert "text/csv" in csv_res.headers["content-type"]
 
-@pytest.mark.asyncio
-async def test_pdf_export_no_threats():
-    # Make sure DB has no alerts to test empty state handling
-    from app.database.client import get_db_client, init_db
-    await init_db()
-    client = await get_db_client()
-    await client.table("threat_alerts").delete().neq("status", "fake_status_to_delete_all").execute()
-    
-    pdf_res = requests.get(f"{BASE_URL}/reporting/export/pdf", timeout=15)
+
+
+def test_pdf_export_is_a_valid_attachment():
+    headers = _authenticated_headers()
+    pdf_res = requests.get(
+        f"{BASE_URL}/reporting/export/pdf",
+        headers=headers,
+        timeout=15,
+    )
     assert pdf_res.status_code == 200
-    # Ideally, we parse the PDF or the backend returns a placeholder PDF.
-    # The requirement is it doesn't crash and returns 200.
+    assert pdf_res.content.startswith(b"%PDF-")
+    assert b"%%EOF" in pdf_res.content
+    assert "attachment;" in pdf_res.headers["content-disposition"]

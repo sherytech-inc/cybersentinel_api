@@ -1,147 +1,309 @@
-import logging
+"""Byte-oriented PDF, JSON, and CSV exports for normalized reports."""
+
+import csv
 import io
 import json
-from datetime import datetime, timezone
-from typing import Dict, Any, List
-from supabase import AsyncClient
-import csv
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib import colors
+from typing import Iterable
 
-logger = logging.getLogger(__name__)
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import (
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
+
+from app.schemas.reporting import ReportSummary
+from .analytics_service import AnalyticsService
+
+
+ALERT_CSV_HEADERS = [
+    "alert_id",
+    "timestamp",
+    "source_ip",
+    "destination_ip",
+    "threat_type",
+    "severity",
+    "score",
+    "status",
+    "action",
+    "analysis_status",
+]
+
+ACTION_CSV_HEADERS = [
+    "action_id",
+    "timestamp",
+    "target",
+    "action",
+    "status",
+    "analyst",
+    "related_alert",
+    "result",
+    "platform",
+]
+
 
 class ExportService:
-    def __init__(self, db: AsyncClient, analytics_service):
-        self._db = db
+    def __init__(self, analytics_service: AnalyticsService):
         self.analytics_service = analytics_service
 
-    async def generate_json(self, time_range: str) -> dict:
-        kpis = await self.analytics_service.get_kpis(time_range)
-        threat_trends = await self.analytics_service.get_threat_trends(time_range)
-        severity = await self.analytics_service.get_severity_distribution(time_range)
-        top_attackers = await self.analytics_service.get_top_attackers(time_range)
-        threat_types = await self.analytics_service.get_top_threat_types(time_range)
-        intel = await self.analytics_service.get_intelligence_overview(time_range)
-        response = await self.analytics_service.get_response_analytics(time_range)
-        
-        return {
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "time_range": time_range,
-            "kpis": kpis,
-            "threat_trends": threat_trends,
-            "severity_distribution": severity,
-            "top_attackers": top_attackers,
-            "top_threat_types": threat_types,
-            "intelligence_overview": intel,
-            "response_analytics": response
-        }
+    @staticmethod
+    def generate_json(summary: ReportSummary) -> bytes:
+        return json.dumps(
+            summary.model_dump(mode="json"),
+            ensure_ascii=False,
+            indent=2,
+        ).encode("utf-8")
 
-    async def generate_csv(self, data_type: str, time_range: str) -> str:
-        cutoff = self.analytics_service._get_time_cutoff(time_range)
-        output = io.StringIO()
-        writer = csv.writer(output)
-        
-        if data_type == "alerts":
-            query = self._db.table("threat_alerts").select("*").gte("created_at", cutoff).order("created_at", desc=True)
-            from app.database.client import db_has_demo_columns
-            if db_has_demo_columns(): query = query.neq("is_demo", True)
-            res = await query.execute()
-            
-            if not res.data:
-                return "No data found."
-            keys = res.data[0].keys()
-            writer.writerow(keys)
-            for row in res.data:
-                writer.writerow([row.get(k) for k in keys])
-        elif data_type == "actions":
-            query = self._db.table("firewall_actions").select("*").gte("created_at", cutoff).order("created_at", desc=True)
-            from app.database.client import db_has_demo_columns
-            if db_has_demo_columns(): query = query.neq("is_demo", True)
-            res = await query.execute()
-            
-            if not res.data:
-                return "No data found."
-            keys = res.data[0].keys()
-            writer.writerow(keys)
-            for row in res.data:
-                writer.writerow([row.get(k) for k in keys])
-        else:
-            writer.writerow(["Error", "Invalid data type"])
-            
-        return output.getvalue()
+    @staticmethod
+    def _csv_bytes(headers: list[str], rows: Iterable[dict]) -> bytes:
+        output = io.StringIO(newline="")
+        writer = csv.DictWriter(
+            output,
+            fieldnames=headers,
+            extrasaction="ignore",
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") or "" for key in headers})
+        return output.getvalue().encode("utf-8")
 
-    def _generate_recommendations(self, top_attackers: List[Dict], threat_types: List[Dict]) -> List[str]:
-        recs = []
-        if top_attackers:
-            top_ip = top_attackers[0]['ip']
-            recs.append(f"Block recurring highly active IP: {top_ip}")
-            countries = set(a['country'] for a in top_attackers if a['country'] != 'Unknown')
-            if countries:
-                recs.append(f"Monitor outbound traffic to high-risk countries: {', '.join(countries)}")
-                
-        if threat_types:
-            top_type = threat_types[0]['type']
-            recs.append(f"Investigate elevated {top_type} activity")
-            
-        recs.append("Review firewall policies for repeated alerts")
-        return recs
+    async def generate_alerts_csv(self) -> tuple[bytes, bool]:
+        result = await self.analytics_service.get_report_alerts()
+        rows = [
+            {
+                "alert_id": row.get("alert_id"),
+                "timestamp": row.get("created_at"),
+                "source_ip": row.get("source_ip"),
+                "destination_ip": "",
+                "threat_type": row.get("model1_classification"),
+                "severity": row.get("severity"),
+                "score": row.get("threat_score"),
+                "status": row.get("status"),
+                "action": row.get("action"),
+                "analysis_status": "",
+            }
+            for row in result.rows
+        ]
+        return self._csv_bytes(ALERT_CSV_HEADERS, rows), result.available
 
-    async def generate_pdf_report(self, time_range: str) -> bytes:
-        data = await self.generate_json(time_range)
-        
+    async def generate_actions_csv(self) -> tuple[bytes, bool]:
+        result = await self.analytics_service.get_report_actions()
+        return (
+            self._csv_bytes(ACTION_CSV_HEADERS, result.rows),
+            result.available,
+        )
+
+    @staticmethod
+    def generate_pdf_report(summary: ReportSummary) -> bytes:
         buffer = io.BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=letter)
+        document = SimpleDocTemplate(
+            buffer,
+            pagesize=letter,
+            title="CyberSentinel Security Report",
+            author="CyberSentinel",
+        )
         styles = getSampleStyleSheet()
-        title_style = styles['Title']
-        heading_style = styles['Heading2']
-        normal_style = styles['Normal']
-        
-        story = []
-        
-        # Title
-        story.append(Paragraph(f"CyberSentinel Executive Security Report", title_style))
-        story.append(Paragraph(f"Generated: {data['generated_at']} | Time Range: {time_range}", normal_style))
-        story.append(Spacer(1, 20))
-        
-        # Executive Summary
-        story.append(Paragraph("Executive Summary", heading_style))
-        kpis = data["kpis"]
-        summary_text = (f"During the last {time_range}, CyberSentinel detected {kpis['total_threats']} threats, "
-                        f"including {kpis['critical_threats']} critical incidents. "
-                        f"The SOC responded to {kpis['response_actions']} events and executed {kpis['recorded_blocks']} block actions.")
-        story.append(Paragraph(summary_text, normal_style))
-        story.append(Spacer(1, 20))
-        
-        # Top Attackers Table
-        story.append(Paragraph("Top Threat Sources", heading_style))
-        table_data = [["IP Address", "Country", "Threats", "Severity"]]
-        for a in data["top_attackers"]:
-            table_data.append([a["ip"], a["country"], str(a["count"]), a["highest_severity"]])
-            
-        if len(table_data) > 1:
-            t = Table(table_data, colWidths=[150, 100, 80, 100])
-            t.setStyle(TableStyle([
-                ('BACKGROUND', (0,0), (-1,0), colors.grey),
-                ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
-                ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-                ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-                ('BOTTOMPADDING', (0,0), (-1,0), 12),
-                ('BACKGROUND', (0,1), (-1,-1), colors.beige),
-                ('GRID', (0,0), (-1,-1), 1, colors.black),
-            ]))
-            story.append(t)
-        else:
-            story.append(Paragraph("No significant attackers detected.", normal_style))
-            
-        story.append(Spacer(1, 20))
-        
-        # Recommendations
-        story.append(Paragraph("Security Recommendations", heading_style))
-        recs = self._generate_recommendations(data["top_attackers"], data["top_threat_types"])
-        for i, rec in enumerate(recs, 1):
-            story.append(Paragraph(f"{i}. {rec}", normal_style))
-            
-        doc.build(story)
+        story = [
+            Paragraph("CyberSentinel Security Report", styles["Title"]),
+            Paragraph(
+                f"Generated: {summary.generated_at.isoformat()}",
+                styles["Normal"],
+            ),
+            Paragraph(
+                f"Timeframe: {summary.timeframe.replace('_', ' ').title()} | "
+                f"Monitoring: {summary.monitoring_state.title()}",
+                styles["Normal"],
+            ),
+            Paragraph(
+                f"Interface: {summary.interface or 'Unavailable'}",
+                styles["Normal"],
+            ),
+            Spacer(1, 16),
+            Paragraph("Session Summary", styles["Heading2"]),
+        ]
+        session = summary.session
+        session_rows = [
+            ["Captured", str(session.captured)],
+            ["Analyzed", str(session.analyzed)],
+            ["Pending", str(session.pending)],
+            ["Complete", str(session.complete)],
+            ["Partial", str(session.partial)],
+            ["Failed", str(session.failed)],
+            ["Deferred", str(session.deferred)],
+            ["Not analyzed", str(session.not_analyzed)],
+            ["Analysis completion", f"{session.completion_percentage:.1f}%"],
+            [
+                "Threat score",
+                (
+                    f"{session.threat_score:.1f} / 100"
+                    if session.threat_score is not None
+                    else "N/A"
+                ),
+            ],
+            ["Highest severity", session.highest_severity or "N/A"],
+        ]
+        story.append(ExportService._styled_table(session_rows))
+        story.extend(
+            [
+                Spacer(1, 16),
+                Paragraph("Classification Distribution", styles["Heading2"]),
+                ExportService._styled_table(
+                    [
+                        ["Normal", str(summary.classification_distribution.normal)],
+                        [
+                            "Suspicious",
+                            str(summary.classification_distribution.suspicious),
+                        ],
+                        [
+                            "Malicious",
+                            str(summary.classification_distribution.malicious),
+                        ],
+                        ["Unknown", str(summary.classification_distribution.unknown)],
+                    ]
+                ),
+                Spacer(1, 16),
+                Paragraph("Severity Distribution", styles["Heading2"]),
+                ExportService._styled_table(
+                    [
+                        ["Low", str(summary.severity_distribution.low)],
+                        ["Medium", str(summary.severity_distribution.medium)],
+                        ["High", str(summary.severity_distribution.high)],
+                        ["Critical", str(summary.severity_distribution.critical)],
+                        ["Unknown", str(summary.severity_distribution.unknown)],
+                    ]
+                ),
+            ]
+        )
+
+        story.extend(
+            ExportService._list_section(
+                "Top Threat Types",
+                [
+                    f"{item.threat_type}: {item.count}"
+                    for item in summary.top_threat_types
+                ],
+                "No analyzed threat-type evidence is available.",
+                styles,
+            )
+        )
+        story.extend(
+            ExportService._list_section(
+                "Top Attackers",
+                [
+                    f"{item.source_ip}: {item.count} alert(s), "
+                    f"severity {item.highest_severity or 'unknown'}, "
+                    f"country {item.country or 'unavailable'}"
+                    for item in summary.top_attackers
+                ],
+                "No attacker evidence is available.",
+                styles,
+            )
+        )
+        story.extend(
+            ExportService._list_section(
+                "Recent Alerts",
+                [
+                    f"{item.timestamp or 'Unknown time'} — "
+                    f"{item.source_ip or 'Unknown source'} — "
+                    f"{item.threat_type or 'Unclassified'} — "
+                    f"{item.severity or 'Unknown severity'}"
+                    for item in summary.recent_alerts
+                ],
+                "No recent alerts are available.",
+                styles,
+            )
+        )
+        story.extend(
+            ExportService._list_section(
+                "Response Timeline",
+                [
+                    f"{item.timestamp or 'Unknown time'} — {item.action} — "
+                    f"{item.target or 'Unknown target'} — "
+                    f"{item.status or 'Unknown status'}"
+                    for item in summary.response_timeline
+                ],
+                "No response actions are available.",
+                styles,
+            )
+        )
+        model = summary.model_availability
+        story.extend(
+            [
+                Spacer(1, 16),
+                Paragraph("Model Availability", styles["Heading2"]),
+                ExportService._styled_table(
+                    [
+                        ["Model 1 evaluated", str(model.model1_evaluated)],
+                        ["Model 2 evaluated", str(model.model2_evaluated)],
+                        [
+                            "Model 3 available",
+                            (
+                                str(model.model3_available)
+                                if model.model3_available is not None
+                                else "Unavailable"
+                            ),
+                        ],
+                        ["Partial analysis", str(model.partial_analysis)],
+                        ["Failed analysis", str(model.failed_analysis)],
+                    ]
+                ),
+                Spacer(1, 16),
+                Paragraph("Source Availability", styles["Heading2"]),
+                ExportService._styled_table(
+                    [
+                        ["Capture", summary.source_status.capture],
+                        ["Alerts", summary.source_status.alerts],
+                        ["Actions", summary.source_status.actions],
+                        ["Intelligence", summary.source_status.intelligence],
+                    ]
+                ),
+            ]
+        )
+        if summary.messages:
+            story.extend(
+                ExportService._list_section(
+                    "Notes",
+                    summary.messages,
+                    "No additional notes.",
+                    styles,
+                )
+            )
+
+        document.build(story)
         return buffer.getvalue()
+
+    @staticmethod
+    def _styled_table(rows: list[list[str]]) -> Table:
+        table = Table(rows, colWidths=[180, 280], hAlign="LEFT")
+        table.setStyle(
+            TableStyle(
+                [
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
+                    ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#E8F3F8")),
+                    ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("PADDING", (0, 0), (-1, -1), 6),
+                ]
+            )
+        )
+        return table
+
+    @staticmethod
+    def _list_section(
+        title: str,
+        values: list[str],
+        empty_message: str,
+        styles,
+    ) -> list:
+        content = [Spacer(1, 16), Paragraph(title, styles["Heading2"])]
+        if not values:
+            content.append(Paragraph(empty_message, styles["Normal"]))
+            return content
+        for value in values:
+            content.append(Paragraph(f"• {value}", styles["Normal"]))
+        return content
