@@ -151,28 +151,16 @@ async def test_bootstrap_profile(mock_get_db):
     from unittest.mock import AsyncMock
     mock_db = MagicMock()
     
-    # Mock the authorized_users fetch
-    auth_user_resp = MagicMock()
-    auth_user_resp.data = {
-        "email": "analyst@example.com",
-        "role": "analyst",
-        "is_active": True,
-        "display_name": "Test Analyst"
-    }
-    execute_auth_mock = AsyncMock(return_value=auth_user_resp)
-    mock_db.table.return_value.select.return_value.eq.return_value.single.return_value.execute = execute_auth_mock
-    
-    # Mock the profiles upsert
-    upsert_resp = MagicMock()
-    upsert_resp.data = [{
+    rpc_resp = MagicMock()
+    rpc_resp.data = {
         "user_id": test_id,
         "email": "analyst@example.com",
         "role": "analyst",
         "is_active": True,
         "display_name": "Test Analyst"
-    }]
-    execute_upsert_mock = AsyncMock(return_value=upsert_resp)
-    mock_db.table.return_value.upsert.return_value.execute = execute_upsert_mock
+    }
+    execute_rpc_mock = AsyncMock(return_value=rpc_resp)
+    mock_db.rpc.return_value.execute = execute_rpc_mock
     
     mock_get_db.return_value = mock_db
     
@@ -184,4 +172,5 @@ async def test_bootstrap_profile(mock_get_db):
     data = response.json()
     assert data["status"] == "success"
     assert data["profile"]["user_id"] == test_id
-
+    mock_db.rpc.assert_called_once_with("bootstrap_current_user_profile", {})
+    mock_db.table.assert_not_called()

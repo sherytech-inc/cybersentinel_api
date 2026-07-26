@@ -1,107 +1,103 @@
 import logging
-from fastapi import APIRouter, Depends, HTTPException, Request, status
-from typing import Dict, Any
+from typing import Any, Dict
 
-from app.api.auth_dependencies import get_verified_supabase_user, SupabaseUserIdentity
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from postgrest.exceptions import APIError
+
+from app.api.auth_dependencies import (
+    SupabaseUserIdentity,
+    get_verified_supabase_user,
+)
 from app.database.client import get_db_client
-from app.core.config import get_settings
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Auth"])
 logger = logging.getLogger(__name__)
 
+
+def _bootstrap_error_status(error: APIError) -> tuple[int, str]:
+    reason = (error.message or "").strip().lower()
+    if reason in {"authentication_required", "authenticated_email_missing"}:
+        return status.HTTP_401_UNAUTHORIZED, reason
+    if reason in {"account_not_authorized", "account_disabled"}:
+        return status.HTTP_403_FORBIDDEN, reason
+    if reason == "invalid_authorization_role":
+        return (
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "profile_authorization_configuration_invalid",
+        )
+    return status.HTTP_503_SERVICE_UNAVAILABLE, "profile_storage_unavailable"
+
+
 @router.post("/bootstrap-profile")
 async def bootstrap_profile(
     request: Request,
-    user: SupabaseUserIdentity = Depends(get_verified_supabase_user)
+    user: SupabaseUserIdentity = Depends(get_verified_supabase_user),
 ) -> Dict[str, Any]:
     """
-    Atomic and body-independent verification of user registration.
-    Triggered by Flutter after successful Supabase Auth (Email or Google).
-    """
-    settings = get_settings()
-    normalized_email = user.email.strip().lower()
+    Bootstrap the caller's profile through the audited, creator-scoped RPC.
 
+    The database client carries the same verified JWT, so auth.uid() and the
+    signed email claim are authoritative inside the SECURITY DEFINER function.
+    """
+    normalized_email = user.email.strip().lower()
     if not normalized_email:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="The authenticated account does not contain a valid email.",
+            detail="authenticated_email_missing",
         )
 
     try:
         db = await get_db_client(request)
     except Exception:
-        logger.exception("Profile database client initialization failed")
+        logger.error("Profile database client unavailable")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="profile_storage_unavailable",
         )
-    
-    if settings.ALLOW_SELF_REGISTRATION:
-        # Create user in authorized_users if not exists
-        try:
-            await db.table("authorized_users").upsert({
-                "email": normalized_email,
-                "role": "analyst",
-                "display_name": normalized_email,
-                "is_active": True
-            }, on_conflict="email", ignore_duplicates=True).execute()
-        except Exception as e:
-            logger.error("Error upserting authorized_user: %s", e)
-            # Proceed anyway, authorized_users select will catch failure
-    
-    # Check authorized_users
-    try:
-        auth_user_resp = await db.table("authorized_users").select("*").eq("email", normalized_email).single().execute()
-        auth_user = auth_user_resp.data
-        if not auth_user:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="This account has not been authorized to access CyberSentinel."
-            )
-    except Exception as e:
-        if isinstance(e, HTTPException):
-            raise
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="This account has not been authorized to access CyberSentinel."
-        )
-        
-    if not auth_user.get("is_active", False):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="This CyberSentinel account has been disabled."
-        )
 
-    role = auth_user.get("role", "analyst")
-    display_name = auth_user.get("display_name", normalized_email)
-
-    # Upsert the profile with retry-safe convergence
-    profile_data = {
-        "user_id": str(user.user_id),
-        "email": normalized_email,
-        "display_name": display_name,
-        "role": role,
-        "is_active": True
-    }
-    
     try:
-        res = await db.table("profiles").upsert(
-            profile_data, 
-            on_conflict="user_id"
+        response = await db.rpc(
+            "bootstrap_current_user_profile",
+            {},
         ).execute()
-        
-        if not res.data:
-            raise Exception("Upsert failed to return data")
-            
-        profile = res.data[0]
-    except Exception as e:
-        logger.error("Error during profile bootstrap: %s", e)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to complete profile registration."
+    except APIError as error:
+        status_code, detail = _bootstrap_error_status(error)
+        logger.warning(
+            "Profile bootstrap RPC rejected | code=%s reason=%s",
+            error.code or "unknown",
+            detail,
         )
-        
+        raise HTTPException(
+            status_code=status_code,
+            detail=detail,
+        ) from error
+    except Exception as error:
+        logger.error(
+            "Profile bootstrap RPC unavailable | type=%s",
+            type(error).__name__,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="profile_storage_unavailable",
+        ) from error
+
+    profile = response.data
+    if isinstance(profile, list):
+        profile = profile[0] if len(profile) == 1 else None
+    if (
+        not isinstance(profile, dict)
+        or str(profile.get("user_id")) != str(user.user_id)
+        or str(profile.get("email", "")).strip().lower() != normalized_email
+        or profile.get("is_active") is not True
+        or profile.get("role") not in {"analyst", "admin"}
+    ):
+        logger.error("Profile bootstrap RPC returned an invalid result")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="profile_storage_unavailable",
+        )
+
     return {
         "status": "success",
-        "profile": profile
+        "profile": profile,
     }
