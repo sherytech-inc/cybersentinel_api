@@ -18,6 +18,7 @@ from app.services.packet_capture.capture_service import init_capture_service, ge
 from app.api.packet_routes import router as packet_router
 from app.api.analyze_routes import router as analyze_router
 from app.api.operations_routes import router as operations_router
+from app.api.firewall_log_routes import router as firewall_log_router
 from app.api.firewall_action_routes import router as firewall_action_router
 from app.api.copilot_routes import router as copilot_router
 from app.api.scanner_routes import router as scanner_router
@@ -166,6 +167,7 @@ app.include_router(decision_router, dependencies=local_auth)       # Model 4
 app.include_router(packet_router, dependencies=local_auth)         # Packet Capture
 app.include_router(analyze_router, dependencies=local_auth)        # Unified Analyze API
 app.include_router(operations_router, dependencies=local_auth)         # Operations Queries
+app.include_router(firewall_log_router, dependencies=local_auth)       # Read-only firewall log analysis
 app.include_router(firewall_action_router, dependencies=local_auth)    # Firewall Actions
 app.include_router(copilot_router, dependencies=local_auth)            # AI Copilot Context
 app.include_router(scanner_router, dependencies=local_auth)            # Local VirusTotal scanner
